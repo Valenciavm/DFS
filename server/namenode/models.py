@@ -5,7 +5,7 @@ class BlockMetadata:
     block_id: str
     index: int
     size_bytes: int
-    checksum: Optional[str] = None
+    checksum: Optional[str] = None #sha-256 for integrity verification
     replicas: list[str] = [] # datanodes
 
 class FileMetadata:

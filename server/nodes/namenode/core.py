@@ -3,7 +3,7 @@ import asyncio
 import math
 import uuid
 from typing import Optional
-from server.nodes.models import (
+from server.nodes.namenode.models import (
     MetadataStore,
     FileMetadata,
     BlockMetadata,
@@ -172,13 +172,4 @@ class Namenode:
         # Remover comandos despachados
         self.pending_replications = [cmd for cmd in self.pending_replications if cmd not in commands]
         return commands
-
-
-if __name__ == "__main__":
-    namenode = Namenode()
-    asyncio.run(namenode.run())
-
-        
-
-
 

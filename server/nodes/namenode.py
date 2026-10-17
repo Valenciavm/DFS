@@ -3,7 +3,7 @@ import asyncio
 import math
 import uuid
 from typing import Optional
-from server.namenode.models import (
+from server.nodes.models import (
     MetadataStore,
     FileMetadata,
     BlockMetadata,

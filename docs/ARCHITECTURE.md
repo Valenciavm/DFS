@@ -1,6 +1,8 @@
-# DFSha — Architecture and Design Decisions (v0.2)
+# DFSha — Architecture and Design Decisions (v0.4)
 
-Companion of [`API.md`](API.md) (the contract). This document explains **why** the system is built this way, how it meets each requirement, how it will be tested and demonstrated, and which rubric criteria each part supports.
+Companion of [`API.md`](API.md) (the contract, v0.5). This document explains **why** the system is built this way, how it meets each requirement, how it will be tested and demonstrated, and which rubric criteria each part supports.
+
+Since v0.3 it also **unifies the NameNode design with the code already written** (`models.py`, `namenode.py`): Section 4 (NameNode internals), Section 5 (metadata model and state), Section 6 (algorithms) and Appendix A (what the current code already matches and what must change). The code-level reference for the data model is [`NAMENODE_MODELS.md`](NAMENODE_MODELS.md).
 
 ---
 
@@ -33,7 +35,7 @@ flowchart LR
         direction TB
         NN1["NameNode 1<br/>(leader)"]
         NN2["NameNode 2<br/>(standby)"]
-        PG[("PostgreSQL<br/>metadata + leader lease")]
+        PG[("PostgreSQL<br/>hard state + leader lease")]
         NN1 -->|SQL| PG
         NN2 -->|SQL| PG
     end
@@ -53,6 +55,8 @@ flowchart LR
     DP -->|"REST: register, heartbeat, block report<br/>(commands return in the response)"| NN1
 ```
 
+High availability is part of the design from the start: two NameNodes (one leader, one standby) share one PostgreSQL database (Section 5.2).
+
 | Interaction | Protocol | Notes |
 |---|---|---|
 | Client ↔ NameNode | REST/JSON over HTTPS | Metadata only; JWT or API key |
@@ -61,6 +65,8 @@ flowchart LR
 | DataNode → NameNode | REST/JSON over HTTPS | Register, heartbeat, block report; commands come back in the response |
 | NameNode ↔ NameNode | Via PostgreSQL lease row | No direct channel needed |
 | NameNode ↔ PostgreSQL | SQL | Private network only |
+
+The NameNode serves **REST only**; gRPC exists only on the DataNodes (block service).
 
 **Why REST for metadata and control.** Allowed by the statement, FastAPI generates the OpenAPI documentation, and every interface is testable with `curl`. Those messages are small and infrequent, so REST's overhead does not matter and its debuggability does.
 
@@ -73,9 +79,9 @@ flowchart LR
 ## 3. Key flows
 
 **Write (`put`).**
-1. Client → NameNode: `put(path, size)`. NameNode checks permissions, reserves the path, splits the file into blocks, chooses a **pipeline** of DataNodes per block, and returns block ids, tokens and pipelines.
+1. Client → NameNode: `put(path, size)`. NameNode checks permissions, reserves the path (file in `PENDING` state), splits the file into blocks, chooses a **pipeline** of DataNodes per block, and returns block ids, tokens and pipelines.
 2. Client streams each block (in parallel, in chunks) to the first DataNode of its pipeline over gRPC; the DataNode forwards the chunks to the next node as they arrive, verifies the checksum, stores the block (encrypted at rest) and reports `block-received` to the NameNode (REST).
-3. Client → NameNode: `commit` with checksums. NameNode verifies that every block has ≥ `MIN_REPLICAS_COMMIT` confirmed replicas and the checksums match, then makes the file visible in **one transaction**.
+3. Client → NameNode: `commit` with checksums. NameNode verifies that every block has ≥ `MIN_REPLICAS_COMMIT` **confirmed** replicas and the checksums match, then makes the file visible (`COMMITTED`) in **one transaction**.
 
 **Read (`get`).**
 1. Client → NameNode: `get(path)`. Gets blocks, checksums, read tokens and the list of **live** replicas.
@@ -85,7 +91,6 @@ flowchart LR
 1. A DataNode stops sending heartbeats ⇒ after `DEAD_NODE_TIMEOUT_S` the NameNode marks it dead.
 2. A background loop finds blocks with fewer live replicas than the target and adds `replicate` commands to the heartbeat responses of nodes holding a good copy.
 3. Those nodes copy the block to a new node; `block-received` updates the replica map until the target is restored.
-
 
 **Sequence of a write (`put`).**
 
@@ -118,17 +123,264 @@ sequenceDiagram
 
 ---
 
-## 4. Replication and consistency model
+## 4. NameNode internals
+
+### 4.1 Components
+
+```mermaid
+flowchart TB
+    subgraph NN["NameNode process"]
+        API["REST API (FastAPI)<br/>clients and DataNodes"]
+        CORE["NameNode core<br/>prepare, commit, abort,<br/>register, heartbeat, placement"]
+        STORE["MetadataStore<br/>(interface)"]
+        PGI["PostgreSQL implementation"]
+        MEM["In-memory fake<br/>unit tests only"]
+        SOFT["Soft state in memory<br/>DataNode registry, replica locations,<br/>pending commands, reserved bytes"]
+        T1["monitor_datanodes"]
+        T2["monitor_replication"]
+        T3["garbage_collector"]
+        T4["leader_lease"]
+        API --> CORE
+        CORE --> STORE
+        CORE --> SOFT
+        STORE --> PGI
+        STORE -.-> MEM
+        T1 --> SOFT
+        T2 --> SOFT
+        T2 --> STORE
+        T3 --> STORE
+        T3 --> SOFT
+        T4 --> PGI
+    end
+```
+
+The core is a plain Python class with no web code, so it can be unit-tested with fake time and an in-memory store. The REST layer is a thin adapter on top of it.
+
+### 4.2 Background tasks
+
+| Task | Period | What it does | Rules |
+|---|---|---|---|
+| `api_server` | continuous | Serves the REST API for clients and DataNodes (FastAPI / uvicorn). **No gRPC on the NameNode.** | Handlers call the core; see 4.4 for concurrency |
+| `monitor_datanodes` | 5 s | Marks a DataNode dead when it has sent no heartbeat for `DEAD_NODE_TIMEOUT_S` | Uses one monotonic clock; does nothing during `FAILOVER_GRACE_S` after a leader change |
+| `monitor_replication` | 10 s | Compares live, confirmed replicas of each block with `REPLICATION_FACTOR`; queues `replicate` commands (too few) or `delete` commands (too many) | **Only blocks of `COMMITTED` files**; never blocks of uploads in progress. Skips blocks that already have a replication in flight (with a timeout) so a command is not queued twice |
+| `garbage_collector` | 30 s | Expires `PENDING` uploads past `expires_at` (status `ABORTED`, their blocks queued for deletion); removes blocks of deleted or replaced files; handles orphan blocks found in block reports | Deletion is delivered as `delete` commands in heartbeat responses |
+| `leader_lease` | `LEASE_S / 3` | The leader renews the lease and steps down if the renewal fails; the standby tries to acquire an expired lease | Runs in every NameNode |
+
+### 4.3 Rules for the core operations
+
+**`prepare_file_upload(path, size, owner, overwrite)`**
+1. Validate the path (absolute, no `.` / `..`), that the parent directory exists and the caller may write in it, and `size ≤ MAX_FILE_SIZE_BYTES` (`FILE_TOO_LARGE`).
+2. If the path has a non-expired `PENDING` upload → `UPLOAD_IN_PROGRESS`. If it has a `COMMITTED` file and `overwrite` is false → `ALREADY_EXISTS`; with `overwrite`, the old version keeps being served until the new commit.
+3. Require at least `REPLICATION_FACTOR` live DataNodes, otherwise `NOT_ENOUGH_DATANODES`.
+4. Split into blocks and choose a pipeline per block (Section 6). The pipeline is only the **allocation**; the block's `replicas` stay empty until DataNodes confirm.
+5. Create the `FileMetadata` as `PENDING` with `expires_at = now + UPLOAD_TTL_S`. It is indexed by id and by path but **not visible** in directory listings.
+6. Return the plan with a write token per block.
+
+**`commit_file_upload(file_id, blocks, file_checksum)`**
+1. The file must exist. If it is already `COMMITTED` with the same body, return success (idempotent). An `ABORTED` file cannot be committed.
+2. All block indexes are present and the sizes add up to the declared `size`.
+3. Every block has at least `MIN_REPLICAS_COMMIT` confirmed replicas on live nodes, and the checksum sent by the client equals the one the DataNodes reported.
+4. In one transaction: store the block checksums, set `COMMITTED`, link the file in its directory (replacing the old version if `overwrite`, whose blocks are queued for deletion) and set `modified_at`.
+
+**`register_datanode(node_id, internal_addr, public_addr, capacity, used)`**: creates or updates the registry entry; keeps the replica locations already known for that node. Returns the intervals and the current `term`.
+
+**`record_heartbeat(node_id, free_bytes, used_bytes, active_transfers)`**: updates liveness **and free space** (so placement uses real numbers), clears reserved bytes that the heartbeat now covers, and returns `{ term, commands }` taken from the node's own command queue (replicate and delete).
+
+**`block-received(node_id, block_id, size, checksum)`**: adds the node to the block's confirmed replicas and records the checksum it computed.
+
+### 4.4 Time and concurrency rules
+
+- **Clocks.** Liveness (`last_heartbeat`, timeouts) is in-memory and per process, so it uses **one** monotonic clock (`time.monotonic()`) everywhere. Anything that is stored or compared across processes or restarts (`created_at`, `modified_at`, `expires_at`, `lease_expires_at`) uses wall-clock UTC. The two are never subtracted from each other.
+- **Concurrency.** Either every core call runs on the event loop (async handlers, no `await` inside a core method, so each call is atomic), or a single lock guards the store. Background tasks iterate over a **snapshot** (`list(d.values())`), never over a dictionary that another call may be changing.
+
+---
+
+## 5. Metadata model and state
+
+### 5.1 Hard state and soft state
+
+The NameNode's information is split in two, as in HDFS:
+
+| | Hard state | Soft state |
+|---|---|---|
+| **What** | Users, API keys, groups, directory tree, files and their blocks (ids, sizes, checksums, status), ACLs, locks, pending deletes, leader lease, audit log | Which DataNodes exist and are alive, their free space and last heartbeat, **where each replica is**, pending commands per node, replications in flight, allocated pipelines of uploads in progress |
+| **Where** | PostgreSQL | Always in the leader's memory |
+| **Lost on restart or failover?** | No | Yes, and **rebuilt** from register, heartbeats and block reports |
+| **Why** | It must survive any failure and be seen by both NameNodes | It changes every few seconds, so writing it to a database would be pure overhead, and the DataNodes already hold the truth |
+
+Consequence: PostgreSQL is touched only by metadata operations (`mkdir`, `put`, `commit`, `rm`, ACL changes…), **never** by heartbeats or block reports. This keeps the database off the hot path.
+
+### 5.2 High availability from the start
+
+There is no interim single-NameNode version: from the first integration there are **two NameNodes sharing one PostgreSQL database**, with leader election by lease. High availability and replication/consistency weigh 30% of the grade, and retrofitting persistence and failover into a core written for memory would mean rewriting it.
+
+The core talks to the hard state only through the `MetadataStore` interface. The real implementation is backed by PostgreSQL; an in-memory implementation exists **only for unit tests** (fake time, no database). The in-memory dictionaries (`files_by_id`, `files_by_path`, `blocks_by_id`) are the **leader's cache** over the database.
+
+**How it works.**
+- **Writes:** every hard-state change is written to PostgreSQL in a transaction that first checks the lease row (`leader.holder = me AND leader.term = my_term`). A stale leader therefore cannot write, even before it notices it lost the lease.
+- **Reads:** served from the cache, which is valid because only the leader serves and writes.
+- **Takeover:** the new leader loads the hard state from PostgreSQL into memory, waits `FAILOVER_GRACE_S`, and rebuilds the soft state while DataNodes re-register and send block reports (a DataNode that sees a higher `term` sends a block report immediately).
+- **Uploads in flight during a failover:** the file stays `PENDING` in the database; the client retries `commit`, which may answer `INSUFFICIENT_REPLICAS` until the block reports arrive, and the client's `tokens` call returns fresh pipelines for blocks not yet written.
+
+**Suggested build order**, so the Client and the DataNodes can integrate before everything is finished:
+1. Schema and the PostgreSQL-backed `MetadataStore`, plus the in-memory fake for tests.
+2. NameNode core (Section 4.3) with unit tests using fake time.
+3. REST layer, running **one** NameNode against PostgreSQL: the Client and the DataNodes integrate from here.
+4. Lease, `term` fencing and the second NameNode; failover tests T5, T16 and T17.
+
+### 5.3 Model
+
+```mermaid
+classDiagram
+    class MetadataStore {
+        <<interface>>
+        +resolve(path)
+        +mkdir(path, owner)
+        +ls(path)
+        +create_pending_file(file)
+        +commit_file(file_id)
+        +abort_file(file_id)
+        +remove(path)
+    }
+    class DirectoryMetadata {
+        +str name
+        +str owner
+        +DirectoryMetadata parent
+        +dict children
+        +dict files
+        +float created_at
+        +float modified_at
+    }
+    class FileMetadata {
+        +str file_id
+        +str name
+        +str owner
+        +int size_bytes
+        +int block_size
+        +int replication
+        +FileStatus status
+        +str checksum
+        +float created_at
+        +float modified_at
+        +float expires_at
+    }
+    class BlockMetadata {
+        +str block_id
+        +int index
+        +int size_bytes
+        +str checksum
+        +list pipeline
+        +set replicas
+    }
+    class DataNodeInfo {
+        +str node_id
+        +str internal_addr
+        +str public_addr
+        +int capacity_bytes
+        +int used_bytes
+        +float last_heartbeat
+        +bool is_alive
+        +free_bytes()
+    }
+
+    MetadataStore *-- DirectoryMetadata : root
+    DirectoryMetadata o-- DirectoryMetadata : subdirectories
+    DirectoryMetadata *-- FileMetadata : files
+    FileMetadata *-- BlockMetadata : ordered blocks
+    BlockMetadata ..> DataNodeInfo : replicas by node_id
+```
+
+### 5.4 Entities
+
+The code-level reference (Python types, defaults, invariants) is in [`NAMENODE_MODELS.md`](NAMENODE_MODELS.md). In code, the soft-state items below (`pipeline`, `replicas`, `DataNodeInfo`) live in a separate `ClusterState` object keyed by `block_id` / `node_id`, so `MetadataStore` and `BlockMetadata` contain hard state only; the tables keep them next to the block for readability.
+
+**`BlockMetadata`** — one fragment of a file.
+
+| Field | Hard / soft | Description |
+|---|---|---|
+| `block_id` | hard | Opaque id assigned by the NameNode (e.g. `blk_7b0c9e0e_0000`). Other components never parse it |
+| `index` | hard | Position inside the file (0, 1, 2…); the file is rebuilt in this order |
+| `size_bytes` | hard | Real size of the block |
+| `checksum` | hard | SHA-256 (hex) of the plaintext bytes; set at `commit` |
+| `pipeline` | soft | **Allocated** DataNodes for the upload (ordered). Not a confirmation |
+| `replicas` | soft | `node_id`s that **confirmed** holding a valid copy (via `block-received` or a block report) |
+
+**`FileMetadata`** — the whole logical file.
+
+| Field | Description |
+|---|---|
+| `file_id` | Unique id assigned at `put` (format: see open question in Section 16) |
+| `name`, parent | Name inside its directory; the full path is **computed**, not stored (see below) |
+| `owner` | Owning user (comes from the authenticated user) |
+| `size_bytes`, `block_size`, `replication` | Size and the parameters used for this file |
+| `status` | `PENDING` (upload reserved, invisible), `COMMITTED` (visible), `ABORTED` (cancelled or expired; kept briefly, then collected) |
+| `checksum` | Optional SHA-256 of the whole file |
+| `created_at`, `modified_at`, `expires_at` | Timestamps; `expires_at` is set for `PENDING` uploads |
+| `blocks` | Ordered list of `BlockMetadata` |
+
+**`DirectoryMetadata`** — a node of the tree: `name`, `owner`, `parent` (`None` for the root), `children` and `files` **indexed by name** (O(1) lookup, and the unique `(parent, name)` rule), plus `created_at` / `modified_at`.
+
+> **Why the path is computed and not stored in every node.** If each directory and file stored its full path, a `mv` of a directory would have to rewrite the path of all its descendants. With `name` + parent, `mv` changes one reference. The `files_by_path` index is the exception: it is a cache and must be updated on `mv` and `rm`.
+
+**`DataNodeInfo`** (soft) — `node_id`, `internal_addr` (used by other DataNodes), `public_addr` (given to clients), `capacity_bytes`, `used_bytes`, `last_heartbeat`, `is_alive`, and the derived `free_bytes = max(0, capacity − used)`. The NameNode also keeps `reserved_bytes` per node (space promised to uploads in progress, subtracted until the next heartbeat covers it).
+
+**`MetadataStore`** — the namespace manager. It creates the root (`/`, owner `system`), resolves absolute paths, creates directories, lists contents and creates / commits / aborts files. It keeps the secondary indexes `files_by_id`, `files_by_path` and `blocks_by_id` for O(1) answers to reads and block reports without walking the tree.
+
+### 5.5 PostgreSQL schema (hard state)
+
+| Table | Main columns |
+|---|---|
+| `users` | id, username (unique), password_hash, role (`user`/`admin`), created_at |
+| `api_keys` | id, user_id, name, key_hash, created_at, revoked_at |
+| `groups`, `group_members` | name, owner_id · group, user_id |
+| `inodes` | id, parent_id, name, type (`file`/`dir`), owner_id, current_file_id, created_at, modified_at · **unique (parent_id, name)** |
+| `files` | file_id, inode_id, owner_id, size, block_size, replication, status (`pending`/`committed`/`aborted`), checksum, created_at, expires_at |
+| `blocks` | block_id, file_id, idx, size, checksum |
+| `acls` | inode_id, subject (`user:x` / `group:y`), permission |
+| `locks` | lock_id, inode_id, owner_id, mode, expires_at |
+| `pending_deletes` | block_id, requested_at |
+| `leader` | holder, url, term, lease_expires_at (single row) |
+| `audit_log` | ts, user, operation, path, result, request_id |
+
+There are **no** `datanodes` or `block_replicas` tables: that information is soft state (Section 5.1).
+
+---
+
+## 6. Partitioning and placement algorithms
+
+**6.1 Splitting a file into blocks.**
+`num_blocks = max(1, ceil(size / BLOCK_SIZE))`. Every block has `BLOCK_SIZE` bytes except the last one, which holds the remainder; an empty file gets one block of 0 bytes. `ceil` avoids losing the remainder (10 MB with 4 MB blocks is 3 blocks, not 2).
+
+**6.2 Choosing DataNodes for each block (placement).**
+1. Candidates: live nodes whose `free_bytes − reserved_bytes` can hold the block. If there are fewer than `REPLICATION_FACTOR`, fail with `NOT_ENOUGH_DATANODES`.
+2. **For each block separately**, pick `REPLICATION_FACTOR` **distinct** nodes by weighted random sampling without replacement, with probability proportional to free space. Free space favors emptier nodes and the randomness makes consecutive blocks of the same file land on different sets of nodes, so a file is partitioned across the cluster (with exactly 3 nodes and factor 3 every block necessarily uses all three).
+3. Order each pipeline with the node that has the most free space first (it receives from the client).
+4. Add the block size to each chosen node's `reserved_bytes`.
+
+**6.3 Allocation versus confirmation.**
+The pipeline is only the plan. A node counts as a replica of a block when it confirms (`block-received`) or reports the block in a block report. The write quorum (`MIN_REPLICAS_COMMIT`) is checked against **confirmed** replicas, never against the pipeline.
+
+**6.4 Re-replication.**
+- Blocks are examined only for `COMMITTED` files.
+- Priority: blocks with the fewest live replicas first (a block with 1 live replica before one with 2).
+- Source: a live node that holds the block. Target: a live node with free space that does not hold it.
+- The command travels in the heartbeat response of the **source** node. A replication in flight for the same `(block, target)` is not queued again until it times out.
+- Surplus replicas (for example a dead node came back) get a `delete` command.
+
+---
+
+## 7. Replication and consistency model
 
 | Aspect | Decision |
 |---|---|
 | **Data model** | WORM: blocks and committed files are immutable. This removes the update-conflict problem entirely. |
-| **Metadata consistency** | **Strong.** One leader NameNode; all metadata changes are ACID transactions in PostgreSQL. |
+| **Metadata consistency** | **Strong.** One leader NameNode; all hard-state changes are atomic (ACID transactions in PostgreSQL). |
 | **Write quorum** | A file becomes visible only if every block has ≥ `MIN_REPLICAS_COMMIT` (2 of 3) **confirmed** replicas and checksums match. |
 | **Read** | From any live replica (R = 1): safe because blocks are immutable and checksum-verified. No read-your-writes anomalies: a file is invisible until `commit`. |
-| **Atomic visibility** | `commit` is one DB transaction. A reader sees the complete file or nothing. Overwrite swaps the path to the new version in one transaction; old blocks are garbage-collected afterwards. |
+| **Atomic visibility** | `commit` is one transaction. A reader sees the complete file or nothing. Overwrite swaps the path to the new version in one transaction; old blocks are garbage-collected afterwards. |
 | **Replica convergence** | Eventual: heartbeats + block reports + re-replication restore the target count; surplus replicas are deleted; orphan blocks are removed. |
-| **Integrity** | SHA-256 per block (verified by DataNode on write, by client on read) + optional whole-file checksum + GCM authentication tag on every read from disk. Corrupt replicas are detected, discarded and re-created. |
+| **Replica locations** | Soft state: rebuilt from `block-received` and block reports, so they cannot go stale across a failover. |
+| **Integrity** | SHA-256 per block (verified by every DataNode on write, by the client on read) + optional whole-file checksum + GCM authentication tag on every read from disk. Corrupt replicas are detected, discarded and re-created. |
 | **Concurrency** | One writer per path (upload reservation, `UPLOAD_IN_PROGRESS`); unlimited concurrent readers; optional `shared`/`exclusive` locks with automatic expiry. |
 | **Idempotency** | `WriteBlock`, `commit` and `abort` are idempotent, so client retries are safe. |
 
@@ -140,29 +392,31 @@ sequenceDiagram
 | DataNode dies during a write | Pipeline continues with the remaining nodes; `commit` succeeds if the quorum is met, otherwise the client retries the block with a fresh pipeline (`/tokens`) |
 | DataNode dies permanently | Blocks re-replicated onto other nodes; `under_replicated_blocks` returns to 0 |
 | DataNode returns after a long absence | Its block report reveals stale/surplus replicas; surplus ones are deleted |
-| Client dies mid-upload | Reservation expires after `UPLOAD_TTL_S`; reserved blocks are garbage-collected |
+| Client dies mid-upload | Reservation expires after `UPLOAD_TTL_S`; the garbage collector marks it `ABORTED` and deletes the reserved blocks |
 | Block corrupted on disk | Detected on read (tag/checksum) or by report; replica discarded and re-created |
-| Leader NameNode dies | Standby acquires the lease within about `LEASE_S`; clients/DataNodes retry on the new leader; uploads in flight survive |
-| Zombie (stale) leader | DataNodes ignore commands with a lower `term` (fencing) |
-| PostgreSQL unavailable | Metadata operations fail with `503`; **stated limitation**, mitigated by a replica (stretch goal) |
+| Leader NameNode dies | Standby acquires the lease within about `LEASE_S`, loads the hard state, waits `FAILOVER_GRACE_S`; DataNodes re-send block reports; clients retry on the new leader |
+| Leader dies during a `put` | The file stays `PENDING` in the database; the client retries `commit` (it may need a few seconds until block reports rebuild the replica locations) |
+| Zombie (stale) leader | DataNodes ignore commands with a lower `term`; its database writes are rejected by the lease check (fencing) |
+| A NameNode process restarts | It reloads the hard state from PostgreSQL and rebuilds the soft state from heartbeats and block reports |
+| PostgreSQL unavailable | Metadata operations fail with `503`; reads served from the cache keep working; **stated limitation**, mitigated by a replica (stretch goal) |
 
 ---
 
-## 5. Scalability design
+## 8. Scalability design
 
 | Dimension | How DFSha scales / what limits it |
 |---|---|
-| **Storage capacity & throughput** | Add DataNodes: they register themselves and receive new blocks (most-free-space placement). Clients move bytes **directly** to/from DataNodes, so aggregate throughput grows with the number of nodes. |
+| **Storage capacity & throughput** | Add DataNodes: they register themselves and receive new blocks (free-space-weighted placement). Clients move bytes **directly** to/from DataNodes, so aggregate throughput grows with the number of nodes. |
 | **File size** | Files are split into blocks; blocks are placed independently. Bound: `MAX_FILE_SIZE_BYTES` because `put` allocates all blocks up front (documented; incremental allocation is a future improvement). |
-| **Number of files** | Metadata in PostgreSQL with indexes on `(parent_id, name)`; `ls` is paginated. Rough order of magnitude: 1 PB at 64 MB blocks ≈ 16 million block rows — manageable for PostgreSQL. |
-| **Number of users** | The NameNode is stateless apart from the database; per-request work is small (no data passes through it). Block tokens are validated by DataNodes locally, with no NameNode round trip. |
-| **Concurrency** | Parallel block transfers in the client; concurrent readers and writers on different paths; multithreaded/async FastAPI services. |
-| **Control-plane load** | Heartbeats are tiny; block reports are periodic; commands piggyback on responses. |
+| **Number of files** | Hard state in PostgreSQL with indexes on `(parent_id, name)`; `ls` is paginated; the leader serves reads from an in-memory cache. Rough order of magnitude: 1 PB at 64 MB blocks ≈ 16 million block rows — manageable for PostgreSQL. |
+| **Number of users** | The NameNode does small work per request (no data passes through it). Block tokens are validated by DataNodes locally, with no NameNode round trip. |
+| **Concurrency** | Parallel block transfers in the client; concurrent readers and writers on different paths; the NameNode core is atomic per call (Section 4.4). |
+| **Control-plane load** | Heartbeats and block reports only touch memory (soft state), never the database; commands piggyback on responses. |
 | **Known bottleneck & path forward** | The leader NameNode (single writer of metadata). Next steps: read-only standby serving, namespace partitioning (federation by path prefix), read replicas of the database. Mentioned in the report as future work. |
 
 ---
 
-## 6. Security design
+## 9. Security design
 
 | Threat / requirement | Control |
 |---|---|
@@ -179,30 +433,10 @@ sequenceDiagram
 
 ---
 
-## 7. Metadata schema (PostgreSQL)
-
-| Table | Main columns |
-|---|---|
-| `users` | id, username (unique), password_hash, role (`user`/`admin`), created_at |
-| `api_keys` | id, user_id, name, key_hash, created_at, revoked_at |
-| `groups`, `group_members` | name, owner_id · group, user_id |
-| `inodes` | id, parent_id, name, type (`file`/`dir`), owner_id, current_file_id, created_at, modified_at · **unique (parent_id, name)** |
-| `files` | file_id (uuid), inode_id, size, block_size, replication, status (`pending`/`committed`), checksum, upload_expires_at |
-| `blocks` | block_id, file_id, idx, size, checksum |
-| `block_replicas` | block_id, node_id, state, reported_at |
-| `datanodes` | node_id, internal_addr, public_addr, capacity, used, last_heartbeat, state |
-| `acls` | inode_id, subject (`user:x` / `group:y`), permission |
-| `locks` | lock_id, inode_id, owner_id, mode, expires_at |
-| `pending_deletes` | block_id, node_id |
-| `leader` | holder, url, term, lease_expires_at (single row) |
-| `audit_log` | ts, user, operation, path, result, request_id |
-
----
-
-## 8. Execution environment
+## 10. Execution environment
 
 - Every node runs **natively or in Docker**; each exposes an API (statement requirement).
-- **Local cluster:** `docker-compose.yml` with `postgres`, `namenode1`, `namenode2`, `datanode1..3` (optionally `datanode4` to show scaling) and a `client` container. Demo profile: `BLOCK_SIZE=1MB`.
+- **Local cluster:** `docker-compose.yml` with `postgres`, `namenode1`, `namenode2`, `datanode1..3` and a `client` container (optionally `datanode4` to show scaling). Demo profile: `BLOCK_SIZE=1MB`. A single NameNode can run against the same PostgreSQL while the second one is not ready yet.
 - **Cloud (AWS Academy / GCP academic), suggested topology:**
 
 | VM | Runs | Ports |
@@ -214,24 +448,28 @@ sequenceDiagram
 - Configuration through environment variables only (`.env.example` in the repo); secrets never committed.
 - The gRPC stubs of the block service are generated from the `.proto` at build time (`grpcio` / `grpcio-tools`) and are not committed; the Docker images of the client and the DataNodes include that step.
 
-**Suggested repository layout**
+**Repository layout (indicative).** The code already written imports `server.namenode.models`, so the repository uses a `server/` folder. The final layout follows the repository; the tree below only shows what must exist.
 
 ```
 dfsha/
 ├── README.md              # how to run everything + links
-├── API.md                 # contract
-├── ARCHITECTURE.md        # this file
-├── AGENTS.md / CLAUDE.md  # context for AI assistants (short!)
+├── docs/
+│   ├── API.md             # contract
+│   └── ARCHITECTURE.md    # this file
+├── proto/                 # .proto of the block service (gRPC), added by the DataNode owner
+├── server/
+│   ├── namenode/          # models.py, namenode.py, REST layer, MetadataStore implementations
+│   └── datanode/
+├── client/
+├── common/                # shared models, token utils
 ├── docker-compose.yml
 ├── .env.example
-├── proto/                 # .proto of the block service (gRPC), added by the DataNode owner
-├── namenode/  datanode/  client/  common/ (shared models, token utils)
-└── tests/                 # integration + failure scenarios
+└── tests/                 # unit tests (fake clock) + integration and failure scenarios
 ```
 
 ---
 
-## 9. Performance and scalability evidence to collect
+## 11. Performance and scalability evidence to collect
 
 | Experiment | What to measure | Why it matters |
 |---|---|---|
@@ -240,7 +478,7 @@ dfsha/
 | Block size 1 MB vs 4 MB vs 64 MB | Throughput, metadata size | Justifies the default |
 | gRPC chunk size 256 KiB vs 1 MiB vs 2 MiB | Throughput, CPU | Tunes the streaming of blocks |
 | Replication overhead: factor 1 vs 3 | Write time | Cost of availability |
-| NameNode metadata ops: `ls`/`stat`/`mkdir` under N concurrent clients | Requests/s and latency | Control-plane capacity |
+| NameNode metadata ops: `ls`/`stat`/`mkdir` under N concurrent clients | Requests/s and latency | Control-plane capacity (reads from the leader's cache vs writes to PostgreSQL) |
 | Time to restore replication after killing a DataNode | Seconds | Availability/recovery |
 | Time to failover after killing the leader | Seconds and failed requests | HA |
 
@@ -248,7 +486,7 @@ Keep raw numbers and a simple chart for the report.
 
 ---
 
-## 10. Test plan (also the demo script)
+## 12. Test plan (also the demo script)
 
 | # | Scenario | Expected result | Rubric criterion |
 |---|---|---|---|
@@ -266,18 +504,22 @@ Keep raw numbers and a simple chart for the report.
 | T12 | Capture traffic or show TLS on the REST and gRPC channels | No plaintext on the wire | Security |
 | T13 | Register a new DataNode and upload more files | New blocks placed on the new node | Scalability |
 | T14 | Exclusive lock by A; B tries to read/remove | `423 LOCKED`; lock expires automatically | RF3 / concurrency |
-| T15 | Throughput experiments of Section 9 | Table and chart | Scalability / performance |
+| T15 | Throughput experiments of Section 11 | Table and chart | Scalability / performance |
+| T16 | Kill the leader in the middle of a `put`, then let the client retry `commit` | `commit` succeeds once block reports rebuild the replica locations | Availability, consistency |
+| T17 | Restart all NameNodes | Namespace intact; replica locations rebuilt from block reports; reads work | Availability |
+| T18 | Start an upload and never commit it | After `UPLOAD_TTL_S` the file is `ABORTED` and its blocks are deleted | Consistency |
+| T19 | Unit tests with fake time: dead-node detection, quorum check, placement, `monitor_replication` ignoring `PENDING` files | Pass | Design quality |
 
 ---
 
-## 11. Demo video plan (10–15 min)
+## 13. Demo video plan (10–15 min)
 
 | Minutes | Content |
 |---|---|
 | 0:00–1:30 | Problem, option 1, architecture diagram, components and protocols |
 | 1:30–4:30 | CLI tour: login, `mkdir`, `put`, `ls`, `get`, checksum comparison; show block distribution and replicas (T1, T2) |
 | 4:30–7:00 | DataNode failure: read still works, re-replication restored (T3, T4) |
-| 7:00–8:30 | NameNode failover (T5) |
+| 7:00–8:30 | NameNode failover (T5, T16) |
 | 8:30–10:30 | Security: users/groups/ACL, API key, block tokens, encryption at rest, TLS (T9–T12) |
 | 10:30–12:30 | Concurrency and consistency: T7, T8, T14; integrity T6 |
 | 12:30–14:00 | Scalability: add a DataNode (T13) and the performance chart (T15) |
@@ -287,37 +529,113 @@ Tips: rehearse once, keep a pre-recorded backup of the slowest steps, use the de
 
 ---
 
-## 12. Rubric coverage checklist
+## 14. Rubric coverage checklist
 
 | Criterion (weight) | Where it is addressed | Evidence to show |
 |---|---|---|
-| **1. Service definition and architectural design (15%)** | §1, §2, §3, §7, §8 of this file; `API.md` §0 | Requirement mapping table, architecture diagram, flows, schema |
+| **1. Service definition and architectural design (15%)** | §1, §2, §3, §4, §5, §10 of this file; `API.md` §0 | Requirement mapping table, architecture and component diagrams, flows, model and schema |
 | **2. Communications specifications (15%)** | `API.md` (all sections), §2 here | Documented interfaces for client↔NN, client↔DN, DN↔DN, NN↔DN, NN↔NN; OpenAPI at `/docs` (REST) and the `.proto` (gRPC block service); error model with HTTP and gRPC status mapping; examples |
-| **3. Scalability design (15%)** | §5, §9 here; `API.md` §5.1, §7 (placement, pagination) | T13, T15, charts, honest bottleneck analysis |
-| **4. High availability (15%)** | §4 (failure table), §3, `API.md` §7, §9 | T3, T4, T5 live |
-| **5. Replication and data consistency (15%)** | §4 here; `API.md` §5.2, §5.4, §6 | T1, T6, T7, T8 |
-| **6. Security (15%)** | §6 here; `API.md` §2, §4.1, §4.2 | T9–T12, audit log, code review of token validation |
-| **7. Video and final report (10%)** | §10, §11 here | Video plan; report built from this file + test results; reproducible repository (`README`, `docker-compose`, `.env.example`) |
+| **3. Scalability design (15%)** | §6, §8, §11 here; `API.md` §5.1, §7 (placement, pagination) | T13, T15, charts, honest bottleneck analysis |
+| **4. High availability (15%)** | §7 (failure table), §3, §4, §5.2 here; `API.md` §7, §9 | T3, T4, T5, T16, T17 live |
+| **5. Replication and data consistency (15%)** | §6, §7 here; `API.md` §5.2, §5.4, §6 | T1, T6, T7, T8, T18 |
+| **6. Security (15%)** | §9 here; `API.md` §2, §4.1, §4.2 | T9–T12, audit log, code review of token validation |
+| **7. Video and final report (10%)** | §12, §13 here | Video plan; report built from this file + test results; reproducible repository (`README`, `docker-compose`, `.env.example`) |
 
 ### Final report outline (from the deliverables list)
 
 1. Objective and short theoretical framework (GFS, HDFS, block vs object storage)
 2. Service description and problem
-3. Architecture and diagrams (§2 and §3 here)
+3. Architecture and diagrams (§2, §3 and §4 here)
 4. Protocol and API specification (`API.md`)
-5. Partitioning and distribution algorithms (placement, pipeline, re-replication)
+5. Partitioning and distribution algorithms (§5 and §6)
 6. Execution environment (Docker, topology)
-7. Tests and result analysis (§9, §10)
+7. Tests and result analysis (§11, §12)
 8. Limitations and future work
 
 ---
 
-## 13. Known limitations (state them openly)
+## 15. Known limitations (state them openly)
 
 - PostgreSQL is a single point of failure unless a replica is added.
 - The leader NameNode is the only writer of metadata (bottleneck at very large scale).
+- After a failover there is a short window (`FAILOVER_GRACE_S` plus the block reports) in which the leader does not yet know where replicas are, so `commit` may need a retry.
 - `put` allocates all blocks up front; maximum file size is bounded.
 - WORM only: no in-place partial updates.
 - Client-side encryption, 2FA and mutual TLS are stretch goals.
 - The block channel uses gRPC: it cannot be called from a browser or with plain `curl`, and debugging it needs `grpcurl` (with server reflection enabled in development).
 - gRPC needs HTTP/2 end to end: any load balancer or proxy placed in front of the DataNodes must support it.
+
+---
+
+## 16. Decisions and open questions
+
+### Closed in v0.3
+
+| # | Decision | Choice | Why |
+|---|---|---|---|
+| 1 | State split | **Hard state** persisted (PostgreSQL); **soft state** (DataNode liveness, replica locations, pending commands) only in the leader's memory, rebuilt from heartbeats and block reports | Same model as HDFS; keeps the database off the hot path |
+| 2 | High availability from the start | Two NameNodes, PostgreSQL and the lease from the first integration; the `MetadataStore` interface stays so unit tests can use an in-memory fake | HA and replication/consistency weigh 30% of the grade; retrofitting them would mean rewriting the core |
+| 3 | In-memory indexes | `files_by_id`, `files_by_path`, `blocks_by_id` stay as the leader's cache | O(1) lookups; already in the current code |
+| 4 | File status | `PENDING`, `COMMITTED`, `ABORTED` | `ABORTED` makes `abort` and the expiry of uploads idempotent and visible to the garbage collector |
+| 5 | Allocation vs confirmation | Pipeline is a plan; `replicas` holds only confirmed copies | The write quorum can only be checked against confirmations |
+| 6 | Tree representation | `name` + parent reference; path computed | `mv` is O(1) |
+
+### Open (need a team decision)
+
+| # | Topic | Options / notes |
+|---|---|---|
+| A | **Namespace per user.** `API.md` says each user sees their own root `/`, but also that paths can be shared by ACL; today nothing says how a user addresses a file owned by someone else | One global tree with `/users/<name>` hidden by the client, or explicit shared paths. Changes the model, so decide before the schema is final |
+| B | `file_id` format | UUID (as in `API.md`) or opaque id (as in the code: `file_` + 12 hex). If opaque, `API.md` §1 is relaxed |
+| C | Default `BLOCK_SIZE` | Contract: 64 MB (demo 1 MB); code: 4 MB. Pick one default and read it from an environment variable |
+| D | `UPLOAD_TTL` | Contract: 3600 s; code: 300 s |
+| E | Heartbeat from an unknown node | Respond with an error that makes the DataNode register again; the error code must be added to `API.md` |
+| F | Self-signed CA vs public certificates for the demo | Self-signed (fast) / Let's Encrypt (needs domains) |
+| G | PostgreSQL replica for HA of the database | Stretch goal / state as a limitation |
+| H | Client-side encryption (`--encrypt`) | Stretch goal |
+| I | Exact `.proto` of the block service | DataNode owner proposes it by PR; it must follow `API.md` §6 |
+
+---
+
+## Appendix A. Reconciliation with the current NameNode code
+
+What `models.py` and `namenode.py` already match, and what must change. "Adopted" means the idea or structure is kept as is.
+
+### A.1 Adopted from the current code
+
+| Element | Where it lives in this document |
+|---|---|
+| `FileStatus` (`PENDING`, `COMMITTED`, `ABORTED`), invisible until commit | §3, §4.3, §5.4 |
+| `FileMetadata` with `owner`, `created_at`, `expires_at` | §5.4 |
+| `DataNodeInfo` with `is_alive`, `last_heartbeat`, derived `free_bytes`, `address` as `host:port` for gRPC | §5.4 (now with `internal_addr` and `public_addr`) |
+| Indexes `files_by_id`, `files_by_path`, `blocks_by_id` | §5.2, §5.4 |
+| Tasks `monitor_datanodes`, `monitor_replication`, `garbage_collector`, `api_server` | §4.2 |
+| `ceil` block count with minimum of 1 | §6.1 |
+| Placement by free space | §6.2 (now weighted and per block) |
+| Heartbeat returns the node's pending commands | §4.3 |
+| Class diagram of the metadata model | §5.3 (extended) |
+
+### A.2 Changes required in the code
+
+| # | Where | Current behavior | Target |
+|---|---|---|---|
+| 1 | `prepare_file_upload` | `replicas` is filled with the pipeline at allocation time | Keep a separate `pipeline` (plan); `replicas` only from `block-received` / block reports (§6.3) |
+| 2 | `monitor_datanodes`, `record_heartbeat`, `DataNodeInfo` | Loop time (`monotonic`) compared with `time.time()` defaults, so a node that registers and never sends a heartbeat is never marked dead | One monotonic clock for liveness (§4.4) |
+| 3 | `monitor_replication` | Iterates all blocks, including those of `PENDING` files | Only blocks of `COMMITTED` files (§4.2) |
+| 4 | `prepare_file_upload` | One pipeline reused for every block | Pipeline chosen per block, weighted by free space (§6.2) |
+| 5 | `prepare_file_upload` | A `PENDING` upload on the same path is silently overwritten; no `overwrite` option | `UPLOAD_IN_PROGRESS`, `ALREADY_EXISTS`, and `overwrite` semantics (§4.3) |
+| 6 | `prepare_file_upload` | No check on the number of live DataNodes | `NOT_ENOUGH_DATANODES` (§4.3) |
+| 7 | `prepare_file_upload` | `expires_at` is never set | `expires_at = now + UPLOAD_TTL_S` (§4.3) |
+| 8 | `commit_file_upload` | No quorum, size or checksum verification; not idempotent; does not link the file into the directory | Rules in §4.3 |
+| 9 | `record_heartbeat` | Ignores `free_bytes` / `used_bytes`; returns only replication commands; no `term` | Update free space; return `{ term, commands }` including deletes (§4.3) |
+| 10 | `register_datanode` | One `address`; replaces the whole entry | `internal_addr` + `public_addr`; keep known replica locations |
+| 11 | `models.py` | Every node stores its full `path`; `parent` ↔ `children` cycle | `name` + parent, children and files indexed by name (§5.4) |
+| 12 | `models.py` | `FileMetadata` lacks `block_size`, `replication`, `checksum`, `modified_at`; `DirectoryMetadata` lacks timestamps | Add them (§5.4) |
+| 13 | `namenode.py` | `api_server` comment says "HTTP/gRPC" | The NameNode serves REST only (§2) |
+| 14 | `namenode.py` | Defaults as constants (4 MB block, 300 s upload TTL) and default owner `"default_user"` (vs `"system"` in `models.py`) | Read from environment variables with the contract defaults; owner from the authenticated user (open questions C and D) |
+| 15 | `file_id` | `file_` + 12 hex | Open question B |
+| 16 | Concurrency | Core methods are synchronous and will run in a thread pool once FastAPI serves them | Rules in §4.4 |
+| 17 | `models.py` | `MetadataStore` also holds the DataNode registry (`datanodes`) | Move DataNodes, pending commands and in-flight replications to a separate soft-state holder (`ClusterState`); `MetadataStore` keeps only hard state (see `NAMENODE_MODELS.md`) |
+
+### A.3 Not implemented yet (expected at this stage)
+
+PostgreSQL implementation of `MetadataStore`, block tokens, authentication, ACLs and locks, `abort`, `get` / `ls` / `mkdir` / `rm` / `mv`, the leader lease with `term`, the re-replication logic itself (it is a placeholder today), and the REST layer.

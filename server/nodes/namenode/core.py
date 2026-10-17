@@ -3,12 +3,12 @@ import asyncio
 import math
 import uuid
 from typing import Optional
+from server.nodes.namenode.cluster_state import DataNodeInfo
 from server.nodes.namenode.models import (
     MetadataStore,
     FileMetadata,
     BlockMetadata,
     FileStatus,
-    DataNodeInfo,
 )
 
 # Configuration defaults

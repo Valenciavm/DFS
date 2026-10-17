@@ -57,7 +57,7 @@ flowchart LR
 |---|---|---|
 | Client ↔ NameNode | REST/JSON over HTTPS | Metadata only; JWT or API key |
 | Client ↔ DataNode | **gRPC** (HTTP/2 + Protocol Buffers) over TLS | Block read/write, streamed in chunks; block token in call metadata |
-| DataNode ↔ DataNode | **gRPC** over TLS | Write pipeline and re-replication, forwarded chunk by chunk |
+| DataNode ↔ DataNode | **gRPC** over TLS | Write pipeline and re-replication, forwarded chunk by chunk (ver detalle en [`grpc_block_service.md`](grpc_block_service.md)) |
 | DataNode → NameNode | REST/JSON over HTTPS | Register, heartbeat, block report; commands come back in the response |
 | NameNode ↔ NameNode | Via PostgreSQL lease row | No direct channel needed |
 | NameNode ↔ PostgreSQL | SQL | Private network only |

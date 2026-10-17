@@ -1,0 +1,91 @@
+syntax = "proto3";
+
+package dfsha;
+
+// Servicio gRPC expuesto por los DataNodes para transferir bloques
+service BlockService {
+  // Escribe un bloque mediante streaming desde el cliente (o DataNode previo en el pipeline)
+  rpc WriteBlock (stream WriteBlockRequest) returns (WriteBlockResponse);
+
+  // Lee un bloque devolviendo un stream de chunks hacia el cliente
+  rpc ReadBlock (ReadBlockRequest) returns (stream ReadBlockResponse);
+
+  // Consulta el estado/existencia de un bloque sin descargar sus bytes
+  rpc StatBlock (StatBlockRequest) returns (StatBlockResponse);
+
+  // Chequeo de salud del DataNode (no requiere token)
+  rpc Health (HealthRequest) returns (HealthResponse);
+}
+
+// ----------------------------------------------------------------------------
+// Mensajes para WriteBlock
+// ----------------------------------------------------------------------------
+
+message WriteBlockHeader {
+  string block_id = 1;                     // identificador unico del bloque
+  int64 size = 2;                          // tamaño total esperado en bytes
+  string checksum_sha256 = 3;              // checksum sha-256 esperado del bloque completo
+  repeated string pipeline = 4;            // lista ordenada de direcciones (host:puerto) de los siguientes nodos
+}
+
+message WriteBlockRequest {
+  oneof payload {
+    WriteBlockHeader header = 1;           // el primer mensaje de la transmision debe ser el header
+    bytes chunk = 2;                       // los siguientes mensajes contienen los bytes del bloque
+  }
+}
+
+message WriteBlockResponse {
+  string block_id = 1;
+  int64 size = 2;
+  string checksum_sha256 = 3;
+  bool already_existed = 4;                // verdadero si el bloque ya estaba guardado identicamente
+  repeated string failed_downstream = 5;   // nodos del pipeline que fallaron si alguno se cayo
+}
+
+// ----------------------------------------------------------------------------
+// Mensajes para ReadBlock
+// ----------------------------------------------------------------------------
+
+message ReadBlockRequest {
+  string block_id = 1;
+  int64 offset = 2;                        // inicio de lectura (0 para leer desde el principio)
+  int64 length = 3;                        // cantidad de bytes a leer (0 significa hasta el final del bloque)
+}
+
+message ReadBlockHeader {
+  int64 total_size = 1;                    // tamaño total del bloque en disco
+  string checksum_sha256 = 2;              // checksum del bloque completo
+  int64 offset = 3;                        // offset inicial servido
+  int64 length = 4;                        // cantidad de bytes que seran transmitidos
+}
+
+message ReadBlockResponse {
+  oneof payload {
+    ReadBlockHeader header = 1;            // primer mensaje con los metadatos de la lectura
+    bytes chunk = 2;                       // pedazos secuenciales de bytes
+  }
+}
+
+// ----------------------------------------------------------------------------
+// Mensajes para StatBlock y Health
+// ----------------------------------------------------------------------------
+
+message StatBlockRequest {
+  string block_id = 1;
+}
+
+message StatBlockResponse {
+  string block_id = 1;
+  int64 size = 2;
+  string checksum_sha256 = 3;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  string node_id = 1;
+  string status = 2;                       // "ok" o "degraded"
+  int64 free_bytes = 3;
+  int64 total_blocks = 4;
+}

@@ -2,7 +2,8 @@
 
 Only what must survive a NameNode restart and is persisted in PostgreSQL lives
 here: the namespace tree, files and blocks. Soft state (live DataNodes, replica
-locations, pending commands) lives in ``cluster_state.py``.
+locations, pending commands) lives in ``cluster_state.py``. The persisted
+interface over these models is ``store/base.py``.
 
 Reference: docs/NAMENODE_MODELS.md.
 """
@@ -11,13 +12,10 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
-
-from server.nodes.namenode.cluster_state import DataNodeInfo
 
 
 class FileStatus(str, Enum):
-    """Lifecycle of a file entry (see ARCHITECTURE.md section 3)."""
+    """Lifecycle of a file entry (see ARCHITECTURE.md Section 3)."""
 
     PENDING = "PENDING"      # upload reserved; invisible to ls/get; has expires_at
     COMMITTED = "COMMITTED"  # visible and immutable (WORM)
@@ -31,7 +29,7 @@ class BlockMetadata:
     block_id: str
     index: int
     size_bytes: int
-    checksum: Optional[str] = None  # SHA-256 hex of the plaintext block; set at commit
+    checksum: str | None = None  # SHA-256 hex of the plaintext block; set at commit
 
 
 @dataclass
@@ -48,20 +46,24 @@ class FileMetadata:
     block_size: int
     replication: int
     status: FileStatus = FileStatus.PENDING
-    checksum: Optional[str] = None
+    checksum: str | None = None
     created_at: float = field(default_factory=time.time)
     modified_at: float = field(default_factory=time.time)
-    expires_at: Optional[float] = None  # only for PENDING uploads
+    expires_at: float | None = None  # only for PENDING uploads
     blocks: list[BlockMetadata] = field(default_factory=list)
 
 
-@dataclass
+@dataclass(eq=False)
 class DirectoryMetadata:
-    """A node of the namespace tree (hard state)."""
+    """A node of the namespace tree (hard state).
+
+    ``eq=False`` keeps identity comparison: the default dataclass ``__eq__``
+    would walk ``parent`` and ``children`` into each other forever.
+    """
 
     name: str  # "" for the root, otherwise a single path segment
     owner: str
-    parent: Optional[DirectoryMetadata] = None
+    parent: DirectoryMetadata | None = None
     children: dict[str, DirectoryMetadata] = field(default_factory=dict)
     files: dict[str, FileMetadata] = field(default_factory=dict)
     created_at: float = field(default_factory=time.time)
@@ -72,23 +74,12 @@ class DirectoryMetadata:
         if self.parent is None:
             return "/"
         parts: list[str] = []
-        node: Optional[DirectoryMetadata] = self
+        node: DirectoryMetadata | None = self
         while node is not None and node.parent is not None:
             parts.append(node.name)
             node = node.parent
         return "/" + "/".join(reversed(parts))
 
-
-class MetadataStore:
-    """In-memory holder of the hard-state indexes.
-
-    Temporary home: moves to ``store/`` with an interface and a PostgreSQL
-    implementation in a following change.
-    """
-
-    def __init__(self) -> None:
-        self.root: DirectoryMetadata = DirectoryMetadata(name="", owner="system")
-        self.files_by_id: dict[str, FileMetadata] = {}
-        self.files_by_path: dict[str, FileMetadata] = {}
-        self.blocks_by_id: dict[str, BlockMetadata] = {}
-        self.datanodes: dict[str, DataNodeInfo] = {}
+    def is_empty(self) -> bool:
+        """True when it holds neither subdirectories nor committed files."""
+        return not self.children and not self.files

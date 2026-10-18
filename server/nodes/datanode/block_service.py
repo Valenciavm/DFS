@@ -3,6 +3,7 @@
 This is the block-level read/write API clients and other DataNodes talk to. The
 NameNode never carries block bytes.
 """
+import asyncio
 import hashlib
 import os
 from typing import Optional, AsyncIterator
@@ -46,6 +47,9 @@ class BlockServiceImpl(pb2_grpc.BlockServiceServicer):
         file_handle = None  # descriptor del archivo abierto para escribir
         hasher = hashlib.sha256()  # acumulador de hash sha-256 sobre la marcha
         bytes_received = 0  # contador de bytes totales recibidos
+        forward_queue: Optional[asyncio.Queue] = None  # cola para reenviar chunks en paralelo
+        forward_task: Optional[asyncio.Task] = None  # tarea asincrona de reenvio al siguiente nodo
+        failed_downstream: list[str] = []  # nodos de la cadena que hayan fallado
 
         try:
             async for request in request_iterator:
@@ -56,6 +60,22 @@ class BlockServiceImpl(pb2_grpc.BlockServiceServicer):
                     file_handle = open(temp_path, "wb")  # abre archivo temporal para escribir
                     print(f"[{self.dn.node_id}] Recibiendo bloque {header.block_id} ({header.size} bytes)...")
 
+                    # si hay nodos siguientes en el pipeline, arranca el reenvio en caliente
+                    downstream_pipeline = list(header.pipeline)  # copia la lista de siguientes nodos
+                    if downstream_pipeline:
+                        forward_queue = asyncio.Queue()  # cola asincrona que alimenta el reenvio
+                        forward_task = asyncio.create_task(
+                            self._forward_to_next_node(
+                                target_addr=downstream_pipeline[0],  # nodo al que le toca recibir
+                                block_id=header.block_id,
+                                size=header.size,
+                                checksum=header.checksum_sha256,
+                                pipeline=downstream_pipeline[1:],  # resto de la cadena
+                                queue=forward_queue,
+                                failed_downstream=failed_downstream,
+                            )
+                        )
+
                 # 2. mensajes subsecuentes: chunks de bytes del bloque
                 elif request.HasField("chunk"):
                     chunk_data = request.chunk  # extrae los bytes de este pedazo
@@ -64,9 +84,18 @@ class BlockServiceImpl(pb2_grpc.BlockServiceServicer):
                     hasher.update(chunk_data)  # alimenta el calculo del sha-256
                     bytes_received += len(chunk_data)  # suma el tamaño recibido
 
+                    # si hay pipeline activo, el pedazo sale de inmediato al siguiente nodo
+                    if forward_queue:
+                        await forward_queue.put(chunk_data)
+
             # cerramos el archivo temporal al terminar el stream
             if file_handle:
                 file_handle.close()  # asegura que los datos se guarden en disco
+
+            # avisar a la tarea de reenvio que la transmision termino
+            if forward_queue and forward_task:
+                await forward_queue.put(None)  # centinela de fin de transmision
+                await forward_task  # espera a que el siguiente nodo confirme su parte
 
             if header is None:
                 await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Missing WriteBlockHeader")
@@ -90,6 +119,7 @@ class BlockServiceImpl(pb2_grpc.BlockServiceServicer):
                 size=bytes_received,  # tamaño total recibido
                 checksum_sha256=computed_checksum,  # hash verificado
                 already_existed=False,  # no existia previamente
+                failed_downstream=failed_downstream,  # nodos fallidos de la cadena, si los hubo
             )
 
         except grpc.aio.AbortError:
@@ -99,6 +129,50 @@ class BlockServiceImpl(pb2_grpc.BlockServiceServicer):
                 os.remove(temp_path)  # limpia archivo temporal en caso de fallo
             print(f"[{self.dn.node_id}] Error escribiendo bloque: {e}")
             await context.abort(grpc.StatusCode.INTERNAL, str(e))
+
+    async def _forward_to_next_node(
+        self,
+        target_addr: str,
+        block_id: str,
+        size: int,
+        checksum: str,
+        pipeline: list[str],
+        queue: asyncio.Queue,
+        failed_downstream: list[str],
+    ) -> None:
+        """Retransmite los chunks al siguiente nodo del pipeline mientras van llegando."""
+        try:
+            print(f"[{self.dn.node_id}] Conectando con el siguiente nodo del pipeline: {target_addr}...")
+            # TODO(security): canal TLS y x-block-token (API.md secciones 2.1 y 2.3)
+            async with grpc.aio.insecure_channel(target_addr) as channel:  # conexion al siguiente datanode
+                stub = pb2_grpc.BlockServiceStub(channel)  # crea el cliente grpc
+
+                async def generate_requests():
+                    # 1. header inicial con el resto de la cadena
+                    yield pb2.WriteBlockRequest(
+                        header=pb2.WriteBlockHeader(
+                            block_id=block_id,
+                            size=size,
+                            checksum_sha256=checksum,
+                            pipeline=pipeline,
+                        )
+                    )
+                    # 2. chunks conforme salen de la cola
+                    while True:
+                        chunk = await queue.get()  # espera el siguiente pedazo llegado de la red
+                        if chunk is None:  # centinela de fin
+                            break
+                        yield pb2.WriteBlockRequest(chunk=chunk)  # reenvia el pedazo
+
+                resp = await stub.WriteBlock(generate_requests())  # espera confirmacion del siguiente nodo
+                if resp.failed_downstream:
+                    failed_downstream.extend(resp.failed_downstream)  # propaga nodos caidos mas abajo
+                print(f"[{self.dn.node_id}] Pipeline hacia {target_addr} completado.")
+        except Exception as e:
+            # el fallo de un nodo downstream no invalida la copia local: se reporta
+            # y el NameNode programara la re-replicacion (API.md seccion 6.2)
+            print(f"[{self.dn.node_id}] Error en el pipeline hacia {target_addr}: {e}")
+            failed_downstream.append(target_addr)  # anota el nodo caido
 
     async def ReadBlock(
         self, request: pb2.ReadBlockRequest, context: grpc.aio.ServicerContext

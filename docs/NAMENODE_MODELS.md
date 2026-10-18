@@ -1,6 +1,6 @@
-# DFSha — NameNode Metadata Models (v0.3)
+# DFSha — NameNode Metadata Models (v0.2)
 
-Code-level reference for `server/nodes/namenode/models.py`. It complements [`ARCHITECTURE.md`](ARCHITECTURE.md) (Section 5 explains the design, this file gives the Python shape) and follows the contract in [`API.md`](API.md). If they disagree, `API.md` wins for what crosses the wire and `ARCHITECTURE.md` wins for design.
+Code-level reference for `server/namenode/models.py`. It complements [`ARCHITECTURE.md`](ARCHITECTURE.md) (Section 5 explains the design, this file gives the Python shape) and follows the contract in [`API.md`](API.md). If they disagree, `API.md` wins for what crosses the wire and `ARCHITECTURE.md` wins for design.
 
 Replaces the earlier Spanish document "Documentación de Modelos de Metadatos del NameNode". Everything that document described is kept; what changed is listed in Section 8.
 

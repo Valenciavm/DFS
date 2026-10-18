@@ -1,35 +1,30 @@
-# Virtual environments
+# Entornos virtuales
 .venv/
 env/
 venv/
 ENV/
 
-# Python cache and compiled files
+# Python cache y compilados
 __pycache__/
 *.py[cod]
 *$py.class
 *.pyc
 
-# Distribution and packaging artifacts
+# Archivos de distribución y empaquetado
 build/
 dist/
 *.egg-info/
 
-# Generated gRPC stubs (built from proto/*.proto, see docs/grpc_block_service.md)
-*_pb2.py
-*_pb2_grpc.py
-*_pb2.pyi
-
-# Local block storage data (generated physical blocks)
+# Archivos de datos de almacenamiento local (bloques físicos generados)
 data/
 storage/
 *.dat
 
-# Environment variables and secrets
+# Variables de entorno y secretos
 .env
 .env.local
 
-# IDEs and editors
+# IDEs y editores
 .vscode/
 .idea/
 *.swp
@@ -37,11 +32,3 @@ storage/
 
 # Logs
 *.log
-
-# Quality tooling and coverage caches
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.coverage
-.coverage.*
-htmlcov/

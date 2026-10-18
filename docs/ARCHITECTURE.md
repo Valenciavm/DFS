@@ -1,6 +1,6 @@
-# DFSha — Architecture and Design Decisions (v0.5)
+# DFSha — Architecture and Design Decisions (v0.4)
 
-Companion of [`API.md`](API.md) (the contract, v0.6). This document explains **why** the system is built this way, how it meets each requirement, how it will be tested and demonstrated, and which rubric criteria each part supports.
+Companion of [`API.md`](API.md) (the contract, v0.5). This document explains **why** the system is built this way, how it meets each requirement, how it will be tested and demonstrated, and which rubric criteria each part supports.
 
 Since v0.3 it also **unifies the NameNode design with the code already written** (`models.py`, `namenode.py`): Section 4 (NameNode internals), Section 5 (metadata model and state), Section 6 (algorithms) and Appendix A (what the current code already matches and what must change). The code-level reference for the data model is [`NAMENODE_MODELS.md`](NAMENODE_MODELS.md).
 
@@ -448,40 +448,23 @@ The pipeline is only the plan. A node counts as a replica of a block when it con
 - Configuration through environment variables only (`.env.example` in the repo); secrets never committed.
 - The gRPC stubs of the block service are generated from the `.proto` at build time (`grpcio` / `grpcio-tools`) and are not committed; the Docker images of the client and the DataNodes include that step.
 
-**Repository layout.** The code imports `server.nodes.namenode.models`, so the repository uses a `server/` package with `nodes/` underneath. Every directory that contains Python code has an `__init__.py` (omitted below for brevity). Commands are always run from the repository root.
+**Repository layout (indicative).** The code already written imports `server.namenode.models`, so the repository uses a `server/` folder. The final layout follows the repository; the tree below only shows what must exist.
 
 ```
-DFS/
+dfsha/
 ├── README.md              # how to run everything + links
 ├── docs/
-│   ├── API.md               # contract
-│   ├── ARCHITECTURE.md      # this file
-│   ├── NAMENODE_MODELS.md   # code-level metadata reference
-│   └── GRPC_BLOCK_SERVICE.md # data plane implementation notes
+│   ├── API.md             # contract
+│   └── ARCHITECTURE.md    # this file
 ├── proto/                 # .proto of the block service (gRPC), added by the DataNode owner
-├── requirements.txt       # all dependencies, exact versions (==)
-├── requirements-dev.txt   # optional: dev tools (pytest, ruff, mypy)
-├── pytest.ini             # pythonpath = .
+├── server/
+│   ├── namenode/          # models.py, namenode.py, REST layer, MetadataStore implementations
+│   └── datanode/
+├── client/
+├── common/                # shared models, token utils
 ├── docker-compose.yml
 ├── .env.example
-├── .gitattributes         # normalize LF/CRLF
-├── .dockerignore
-├── client/                # CLI + Python library (from client import DFShaClient)
-│   ├── Dockerfile
-│   ├── cli.py
-│   └── tests/
-├── server/                # the two daemons
-│   ├── common/            # config, error codes, block tokens (shared NN/DN)
-│   └── nodes/
-│       ├── namenode/      # models.py, cluster_state.py, core.py, store/, api/
-│       │   ├── Dockerfile
-│       │   ├── __main__.py
-│       │   └── tests/
-│       └── datanode/
-│           ├── Dockerfile
-│           ├── __main__.py
-│           └── tests/
-└── tests/                 # integration and failure scenarios (multi-node)
+└── tests/                 # unit tests (fake clock) + integration and failure scenarios
 ```
 
 ---

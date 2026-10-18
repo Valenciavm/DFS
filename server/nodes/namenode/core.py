@@ -37,6 +37,7 @@ from server.nodes.namenode.results import (
     BlockLocation,
     CommittedBlock,
     FileLocation,
+    GcResult,
     PlannedBlock,
     ReplicationScan,
     ReportedBlock,
@@ -714,3 +715,24 @@ class Namenode:
                     self._release_reservation(block_id, node_id)
             if not targets:
                 del self.cluster.in_flight_replications[block_id]
+
+    # ---- garbage collection ------------------------------------------------
+
+    def collect_garbage(self) -> GcResult:
+        """Expires stale uploads and forgets old aborted records (``ARCHITECTURE.md`` Section 4.2).
+
+        A `PENDING` upload past its ``expires_at`` becomes `ABORTED`: its path is
+        freed, its reserved space released, and every node that may hold a piece is
+        told to delete it (test plan T18). The `ABORTED` record is kept for one more
+        ``UPLOAD_TTL_S`` so a late commit or block report can still be recognised
+        instead of looking like an unknown id, and is then purged.
+        """
+        now = self.clock.time()
+        expired = [
+            f for f in self.store.files(FileStatus.PENDING)
+            if f.expires_at is not None and f.expires_at <= now
+        ]
+        for file in expired:
+            self._abort(file, now)
+        purged = self.store.purge_aborted(older_than=now - self.settings.upload_ttl_s)
+        return GcResult(expired=len(expired), purged=len(purged))

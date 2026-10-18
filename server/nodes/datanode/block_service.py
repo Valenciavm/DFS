@@ -6,7 +6,7 @@ NameNode never carries block bytes.
 import asyncio
 import hashlib
 import os
-from typing import Optional, AsyncIterator
+from collections.abc import AsyncIterator
 
 import grpc
 
@@ -42,13 +42,13 @@ class BlockServiceImpl(pb2_grpc.BlockServiceServicer):
         context: grpc.aio.ServicerContext,
     ) -> pb2.WriteBlockResponse:
         """Recibe un stream de chunks de bytes para guardar un bloque en disco."""
-        header: Optional[pb2.WriteBlockHeader] = None  # metadatos recibidos en el primer mensaje
-        temp_path: Optional[str] = None  # ruta temporal donde se escriben los chunks
+        header: pb2.WriteBlockHeader | None = None  # metadatos recibidos en el primer mensaje
+        temp_path: str | None = None  # ruta temporal donde se escriben los chunks
         file_handle = None  # descriptor del archivo abierto para escribir
         hasher = hashlib.sha256()  # acumulador de hash sha-256 sobre la marcha
         bytes_received = 0  # contador de bytes totales recibidos
-        forward_queue: Optional[asyncio.Queue] = None  # cola para reenviar chunks en paralelo
-        forward_task: Optional[asyncio.Task] = None  # tarea asincrona de reenvio al siguiente nodo
+        forward_queue: asyncio.Queue | None = None  # cola para reenviar chunks en paralelo
+        forward_task: asyncio.Task | None = None  # tarea asincrona de reenvio al siguiente nodo
         failed_downstream: list[str] = []  # nodos de la cadena que hayan fallado
 
         try:
@@ -57,7 +57,9 @@ class BlockServiceImpl(pb2_grpc.BlockServiceServicer):
                 if request.HasField("header"):
                     header = request.header  # extrae el objeto writeblockheader
                     temp_path = self.storage.get_temp_block_path(header.block_id)  # ruta temporal .tmp
-                    file_handle = open(temp_path, "wb")  # abre archivo temporal para escribir
+                    # el descriptor vive durante todo el stream, no cabe en un `with`.
+                    # TODO(perf): mover la escritura a un executor; bloquea el event loop
+                    file_handle = open(temp_path, "wb")  # noqa: ASYNC230, SIM115
                     print(f"[{self.dn.node_id}] Recibiendo bloque {header.block_id} ({header.size} bytes)...")
 
                     # si hay nodos siguientes en el pipeline, arranca el reenvio en caliente
@@ -124,7 +126,7 @@ class BlockServiceImpl(pb2_grpc.BlockServiceServicer):
 
         except grpc.aio.AbortError:
             raise  # context.abort ya decidio el estado de la llamada
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - cualquier fallo debe limpiar el .tmp
             if temp_path and os.path.exists(temp_path):
                 os.remove(temp_path)  # limpia archivo temporal en caso de fallo
             print(f"[{self.dn.node_id}] Error escribiendo bloque: {e}")
@@ -168,7 +170,7 @@ class BlockServiceImpl(pb2_grpc.BlockServiceServicer):
                 if resp.failed_downstream:
                     failed_downstream.extend(resp.failed_downstream)  # propaga nodos caidos mas abajo
                 print(f"[{self.dn.node_id}] Pipeline hacia {target_addr} completado.")
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - cualquier fallo del nodo siguiente se reporta
             # el fallo de un nodo downstream no invalida la copia local: se reporta
             # y el NameNode programara la re-replicacion (API.md seccion 6.2)
             print(f"[{self.dn.node_id}] Error en el pipeline hacia {target_addr}: {e}")

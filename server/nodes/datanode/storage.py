@@ -3,9 +3,9 @@
 Blocks are plain files named ``<block_id>.dat`` inside one directory. Nothing
 here knows about gRPC or the NameNode: it is the only layer that touches disk.
 """
+import hashlib
 import os
 import shutil
-import hashlib
 
 
 class StorageManager:

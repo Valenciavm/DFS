@@ -1,8 +1,7 @@
 """DataNode lifecycle: block server plus the control channel to the NameNode."""
-import os
 import asyncio
 import hashlib
-from typing import Optional
+import os
 
 import grpc
 
@@ -33,7 +32,7 @@ class DataNode:
         self.address = f"{grpc_host}:{grpc_port}"  # direccion completa entregada al cliente
         self.namenode_url = namenode_url  # url del namenode para enviar rest
         self.storage = StorageManager(storage_dir)  # gestor del disco duro local
-        self.grpc_server: Optional[grpc.aio.Server] = None  # instancia del servidor grpc
+        self.grpc_server: grpc.aio.Server | None = None  # instancia del servidor grpc
 
     async def run(self):
         """Ciclo de vida principal del DataNode: registro y tareas en paralelo."""
@@ -59,7 +58,7 @@ class DataNode:
         # aqui se hara el request http usando httpx:
         # async with httpx.AsyncClient() as client:
         #     await client.post(f"{self.namenode_url}/v1/nodes/register", json=payload)
-        print(f"[DataNode {self.node_id}] Registrado en NameNode ({self.address}).")
+        print(f"[DataNode {self.node_id}] Registro pendiente de envío: {payload}")
 
     async def heartbeat_loop(self):
         """Envía latidos periódicos al NameNode y procesa comandos recibidos."""
@@ -71,7 +70,7 @@ class DataNode:
                 #     commands = res.json().get("commands", [])
                 #     await self.handle_commands(commands)
                 await asyncio.sleep(DEFAULT_HEARTBEAT_INTERVAL)  # espera antes del siguiente latido
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - el bucle de latidos nunca debe morir
                 print(f"[DataNode {self.node_id}] Error enviando heartbeat: {e}")
                 await asyncio.sleep(DEFAULT_HEARTBEAT_INTERVAL)
 
@@ -115,7 +114,7 @@ class DataNode:
         await self.grpc_server.wait_for_termination()  # mantiene vivo el servidor
 
     async def replicate_block_to_node(
-        self, block_id: str, target_address: str, token: Optional[str] = None
+        self, block_id: str, target_address: str, token: str | None = None
     ):
         """Envía una copia de un bloque local hacia otro DataNode por gRPC.
 

@@ -579,7 +579,7 @@ DFS/
 | Experiment | What to measure | Why it matters |
 |---|---|---|
 | Upload/download of 100 MB–1 GB with 1, 2, 4, 8 parallel transfers | Throughput (MB/s) | Concurrency and parallel block transfer |
-| Same file with 1 vs 3 vs 4 DataNodes | Throughput and block distribution | Scalability by adding nodes |
+| Same file with 3 vs 5 vs 7 DataNodes | Throughput and block distribution (blocks per node, and whether any node holds the whole file) | Scalability by adding nodes; also the evidence that partitioning is real (Section 6.2) |
 | Block size 1 MB vs 4 MB vs 64 MB | Throughput, metadata size | Justifies the default |
 | gRPC chunk size 256 KiB vs 1 MiB vs 2 MiB | Throughput, CPU | Tunes the streaming of blocks |
 | Replication overhead: factor 1 vs 3 | Write time | Cost of availability |
@@ -596,9 +596,9 @@ Keep raw numbers and a simple chart for the report.
 | # | Scenario | Expected result | Rubric criterion |
 |---|---|---|---|
 | T1 | `put` a 100 MB random file then `get` it; compare SHA-256 | Identical | Replication & consistency |
-| T2 | Inspect block placement with `/v1/admin/blocks/{id}` | Blocks of one file on different nodes; 3 replicas each | Design, scalability |
+| T2 | Inspect block placement with `/v1/admin/blocks/{id}` on a **5-node** cluster | Blocks of one file spread over different node sets, 3 replicas each, and **no single node holding the whole file** — partitioning and replication shown as separate properties | Design, scalability |
 | T3 | Kill a DataNode during `get` | Download completes via other replicas | Availability |
-| T4 | Kill a DataNode; watch `/v1/admin/stats` | `under_replicated_blocks` rises, then returns to 0 | Availability, replication |
+| T4 | Kill a DataNode; watch `/v1/admin/stats` | `under_replicated_blocks` rises, then returns to 0. **Requires more nodes than `REPLICATION_FACTOR`**: repair needs a live node that does not already hold the block, so on a 3-node cluster with factor 3 this can never reach 0 (Section 6.2) | Availability, replication |
 | T5 | Kill the leader NameNode during a transfer | Standby becomes leader in ~`LEASE_S`; operations resume; data intact | Availability |
 | T6 | Corrupt a block file on a DataNode's disk, then read it | Corruption detected; read served from another replica; replica repaired | Consistency |
 | T7 | Two clients `put` the same path | One succeeds, the other gets `409 UPLOAD_IN_PROGRESS` | Consistency |
@@ -614,6 +614,11 @@ Keep raw numbers and a simple chart for the report.
 | T17 | Restart all NameNodes | Namespace intact; replica locations rebuilt from block reports; reads work | Availability |
 | T18 | Start an upload and never commit it | After `UPLOAD_TTL_S` the file is `ABORTED` and its blocks are deleted | Consistency |
 | T19 | Unit tests with fake time: dead-node detection, quorum check, placement, `monitor_replication` ignoring `PENDING` files | Pass | Design quality |
+| T20 | Kill the PostgreSQL **primary** mid-operation, then promote the replica | Writes answer `503` and `/v1/ha/status` reports `degraded: true` while reads keep working from the leader's cache and in-flight block transfers finish; after promotion writes resume with no metadata loss | Availability |
+| T21 | Enrol TOTP 2FA, then log in: password only, password + valid code, password + reused code, password + recovery code | Password alone returns `mfa_required` and no token; a valid code returns a JWT with `amr: ["pwd","otp"]`; a reused code is rejected; a recovery code works exactly once. An API key keeps working with no second factor | Security |
+| T22 | Connect to a DataNode and to the NameNode's node API with no client certificate, and with one not signed by the cluster CA | TLS handshake refused in both cases; with a valid certificate the call succeeds | Security |
+| T23 | Kill the **middle** node of a write pipeline during a transfer | The upstream node skips the dead hop, the block still reaches 2 replicas, `commit` meets the quorum, `failed_downstream` names the skipped node and re-replication restores the third copy (Section 6.5) | Availability, replication |
+| T24 | Ranged read: `open` a large file, `seek` into the middle and read a few KB | Only the needed block is fetched, and only the requested range crosses the wire; several clients read different ranges of the same file concurrently | Performance, RF3 |
 
 ---
 

@@ -43,8 +43,8 @@ sequenceDiagram
 | RPC | Type | Status |
 |---|---|---|
 | `WriteBlock` | client-streaming | implemented, with pipeline forwarding |
-| `ReadBlock` | server-streaming | implemented for whole blocks |
-| `StatBlock` | unary | declared in the `.proto`, not implemented yet |
+| `ReadBlock` | server-streaming | implemented for ranged reads |
+| `StatBlock` | unary | implemented; returns size and whole-block SHA-256 |
 | `Health` | unary | implemented |
 
 `WriteBlockRequest` uses a `oneof payload`: the **first message must be a `WriteBlockHeader`** (`block_id`, `size`, `checksum_sha256`, `pipeline`), and every message after it carries a `bytes chunk`. `ReadBlockResponse` works the same way, with a `ReadBlockHeader` first.
@@ -63,7 +63,8 @@ python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. proto/block_s
 
 1. **Atomic persistence.** Chunks are written to `<storage>/<block_id>.tmp`. Only after the checksum matches is the file renamed with `os.replace` to `<block_id>.dat`, so a half-written block is never visible under its real name.
 2. **Independent verification per node.** Because a node relays chunks before it has seen the whole block, each node computes its own SHA-256 and compares it against the header. A mismatch deletes the temporary file and aborts with `INVALID_ARGUMENT`; a corrupted stream is rejected by every node and stored by none.
-3. **Pipeline tolerance.** If a downstream node fails, the current node still completes and keeps its own copy, and returns the failed address in `failed_downstream`. The NameNode repairs the missing replica through re-replication, provided `MIN_REPLICAS_COMMIT` is reached before `commit`.
+3. **Pipeline tolerance.** A node checks pipeline availability before consuming the input stream, skips unavailable hops, and forwards to the first reachable node. If that hop fails during transfer, it replays the local disk-backed copy to the next hop without buffering the entire block in memory. Failed addresses are returned in `failed_downstream`.
+4. **Immutable idempotency.** Per-block async locks serialize writes. A matching existing block returns `already_existed=true`; a different size or checksum is rejected. A `.sha256` sidecar caches whole-block metadata so ranged reads only seek/read the requested range.
 
 ---
 
@@ -102,7 +103,7 @@ Send a block to `dn1` with `pipeline=["127.0.0.1:9002"]` and both `./data/dn1/<b
 
 ---
 
-## 5. Not implemented yet
+## 5. Remaining gaps
 
 Tracked here so the gaps against `API.md` Section 6 are explicit:
 
@@ -110,15 +111,9 @@ Section references are to [`API.md`](API.md) unless stated otherwise.
 
 | Gap | Why it matters | Reference |
 |---|---|---|
-| **Skip a dead hop in the pipeline.** A node that cannot reach `pipeline[0]` gives up on the rest of the chain instead of trying the next entry, so one dead node in the middle leaves a single replica instead of two | Measured: three-node chain with the middle node down produced 1 replica, below `MIN_REPLICAS_COMMIT`, forcing a full re-upload. Hits availability and replication directly | `ARCHITECTURE.md` Section 6.5 |
-| **Ranged `ReadBlock`** — `offset` and `length` are ignored and the whole block is read into memory | The statement requires concurrency on "data within a file"; random access depends on this, and loading a 64 MB block to serve 4 KB does not scale | Section 6.3 |
 | TLS on the block channel (channels are insecure today) | Encryption in transit | Section 2.3 |
 | `x-block-token` validation in a server interceptor | Any client can currently read or write any block | Section 2.1 |
 | AES-256-GCM encryption at rest | Encryption in storage | Section 2.3 |
 | Mutual TLS between DataNodes | Node-to-node identity | Section 2 |
 | REST calls to the NameNode: `register`, `heartbeat`, `block-report`, `block-received`, `block-corrupt` | Without these the NameNode cannot count replicas, detect dead nodes or order repairs | Section 7 |
-| `StatBlock` implementation | Declared in the `.proto`, unimplemented | Section 6.4 |
-| Idempotent writes (`already_existed` is always `false`) | Retries currently rewrite the block | Section 6.2 |
-| `x-dfsha-error-code` in trailing metadata | Error model parity with REST | Section 3.1 |
-| Chunk size is 64 KB; the contract default is `BLOCK_CHUNK_SIZE` = 1 MiB | Throughput tuning (experiment in `ARCHITECTURE.md` Section 11) | Section 1 |
 | Server reflection for `grpcurl` in development | Debuggability | Section 6.5 |

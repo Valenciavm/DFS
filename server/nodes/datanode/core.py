@@ -1,13 +1,13 @@
 """DataNode lifecycle: block server plus the control channel to the NameNode."""
 import asyncio
-import hashlib
 import os
 
 import grpc
 
 from proto import block_service_pb2 as pb2
 from proto import block_service_pb2_grpc as pb2_grpc
-from server.nodes.datanode.block_service import BLOCK_CHUNK_SIZE, BlockServiceImpl
+from server.common.config import Settings, settings
+from server.nodes.datanode.block_service import BlockServiceImpl
 from server.nodes.datanode.storage import StorageManager
 
 # Configuración por defecto del DataNode
@@ -25,6 +25,7 @@ class DataNode:
         grpc_port: int = 9001,
         storage_dir: str = "./data/blocks",
         namenode_url: str = DEFAULT_NAMENODE_URL,
+        config: Settings | None = None,
     ):
         self.node_id = node_id  # identificador unico de este nodo (ej: dn1)
         self.grpc_host = grpc_host  # direccion ip o host en que escucha grpc
@@ -32,6 +33,7 @@ class DataNode:
         self.address = f"{grpc_host}:{grpc_port}"  # direccion completa entregada al cliente
         self.namenode_url = namenode_url  # url del namenode para enviar rest
         self.storage = StorageManager(storage_dir)  # gestor del disco duro local
+        self.settings = config or settings
         self.grpc_server: grpc.aio.Server | None = None  # instancia del servidor grpc
 
     async def run(self):
@@ -121,13 +123,11 @@ class DataNode:
         Esto es el lado cliente de un comando ``replicate``: el NameNode nunca
         mueve bytes, solo le pide al nodo origen que lo haga.
         """
-        data = self.storage.read_block(block_id)  # lee los bytes del disco local
-        checksum = hashlib.sha256(data).hexdigest()  # calcula su hash sha-256
-        size = len(data)  # tamaño en bytes
+        size, checksum = self.storage.get_block_info(block_id)
 
         print(f"[DataNode {self.node_id}] Replicando {block_id} ({size} bytes) -> {target_address}...")
 
-        # TODO(security): canal TLS y x-block-token con el `token` recibido (API.md 2.1)
+        # TODO(security): replace the insecure channel with TLS (API.md 2.3)
         async with grpc.aio.insecure_channel(target_address) as channel:  # conecta con el otro datanode
             stub = pb2_grpc.BlockServiceStub(channel)  # crea el stub cliente
 
@@ -138,11 +138,14 @@ class DataNode:
                         block_id=block_id, size=size, checksum_sha256=checksum, pipeline=[]
                     )
                 )
-                # chunks del bloque
-                for i in range(0, size, BLOCK_CHUNK_SIZE):
-                    yield pb2.WriteBlockRequest(chunk=data[i : i + BLOCK_CHUNK_SIZE])
+                with open(  # noqa: ASYNC230
+                    self.storage.get_block_path(block_id), "rb"
+                ) as block_file:
+                    while chunk := block_file.read(self.settings.block_chunk_size):
+                        yield pb2.WriteBlockRequest(chunk=chunk)
 
-            resp = await stub.WriteBlock(generate_requests())  # ejecuta la replicacion remota
+            metadata = (("x-block-token", token),) if token is not None else ()
+            resp = await stub.WriteBlock(generate_requests(), metadata=metadata)
             print(
                 f"[DataNode {self.node_id}] Réplica de {block_id} en {target_address} "
                 f"confirmada: SHA {resp.checksum_sha256[:8]}..."

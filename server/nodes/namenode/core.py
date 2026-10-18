@@ -24,7 +24,7 @@ from server.common.config import ConfigError, Settings
 from server.common.config import settings as default_settings
 from server.common.errors import DfshaError, ErrorCode
 from server.common.paths import join_path, split_path
-from server.common.tokens import BlockOp, mint
+from server.common.tokens import SYSTEM_PRINCIPAL, BlockOp, mint
 from server.nodes.namenode import placement
 from server.nodes.namenode.cluster_state import ClusterState, Command, DataNodeInfo
 from server.nodes.namenode.models import (
@@ -38,6 +38,7 @@ from server.nodes.namenode.results import (
     CommittedBlock,
     FileLocation,
     PlannedBlock,
+    ReplicationScan,
     ReportedBlock,
     UploadPlan,
 )
@@ -626,3 +627,90 @@ class Namenode:
             checksums.pop(node_id, None)
             if not checksums:
                 del self.cluster.replica_checksums[block_id]
+
+    # ---- re-replication ----------------------------------------------------
+
+    def scan_replication(self) -> ReplicationScan:
+        """Restores the target replica count (``ARCHITECTURE.md`` Section 6.6).
+
+        * Only blocks of `COMMITTED` files are examined. A `PENDING` upload is
+          legitimately short of replicas while it is being written.
+        * The most endangered blocks go first: one with a single live replica
+          before one with two.
+        * The ``replicate`` command goes to a node that already holds the block (the
+          **source**); the NameNode never moves bytes itself.
+        * A copy already in flight is not scheduled twice, but gives up after
+          ``IN_FLIGHT_TIMEOUT_S`` so a lost command cannot block a repair forever.
+        * Surplus replicas, for example when a dead node comes back after its blocks
+          were re-created elsewhere, are ordered deleted from the fullest nodes.
+        """
+        mono = self.clock.monotonic()
+        self._expire_in_flight(mono)
+        live = self._live_nodes()
+
+        deficits: list[tuple[int, str, int, FileMetadata, BlockMetadata, list[str]]] = []
+        deleted = 0
+        for file in self.store.files(FileStatus.COMMITTED):
+            for block in file.blocks:
+                holders = self._live_holders(block.block_id)
+                if len(holders) > file.replication:
+                    deleted += self._trim_surplus(block, file.replication, holders)
+                elif len(holders) < file.replication:
+                    deficits.append((len(holders), file.file_id, block.index, file, block, holders))
+        deficits.sort(key=lambda d: d[:3])  # fewest live replicas first, then deterministic
+
+        scheduled = unrecoverable = 0
+        reserved = self.cluster.reserved_bytes
+        for live_count, _, _, file, block, holders in deficits:
+            if live_count == 0:
+                unrecoverable += 1  # nothing left to copy from
+                continue
+            block_id = block.block_id
+            in_flight = self.cluster.in_flight_replications.get(block_id, {})
+            needed = file.replication - live_count - len(in_flight)
+            if needed <= 0:
+                continue
+            exclude = set(self.cluster.replicas.get(block_id, ())) | set(in_flight)
+            eligible = placement.eligible_nodes(live, reserved, block.size_bytes, exclude)
+            targets = placement.weighted_sample(eligible, needed, self.rng, reserved)
+            if not targets:
+                continue  # no node can take it yet; try again next scan
+            source = self.rng.choice(holders)
+            token = mint(
+                block_id, BlockOp.WRITE, SYSTEM_PRINCIPAL,
+                self.settings.block_token_secret, self.settings.token_ttl_s, now=self.clock.time(),
+            )
+            self._enqueue(source, Command("replicate", block_id, [t.node_id for t in targets], token))
+            for target in targets:
+                self.cluster.in_flight_replications.setdefault(block_id, {})[target.node_id] = mono
+                self._reserve(block_id, target.node_id, block.size_bytes)
+            scheduled += 1
+
+        return ReplicationScan(
+            under_replicated=len(deficits),
+            unrecoverable=unrecoverable,
+            scheduled=scheduled,
+            deleted=deleted,
+        )
+
+    def _trim_surplus(self, block: BlockMetadata, keep: int, holders: list[str]) -> int:
+        """Orders the fullest nodes to drop copies until ``keep`` remain."""
+        surplus = len(holders) - keep
+        fullest_first = sorted(
+            holders, key=lambda nid: (self.cluster.datanodes[nid].free_bytes(), nid)
+        )
+        for node_id in fullest_first[:surplus]:
+            self._discard_replica(node_id, block.block_id)
+            self._enqueue(node_id, Command("delete", block.block_id))
+        return surplus
+
+    def _expire_in_flight(self, mono: float) -> None:
+        """Drops copies that timed out or whose target died, releasing their space."""
+        for block_id, targets in list(self.cluster.in_flight_replications.items()):
+            for node_id, started in list(targets.items()):
+                node = self.cluster.datanodes.get(node_id)
+                if node is None or not node.is_alive or mono - started > IN_FLIGHT_TIMEOUT_S:
+                    del targets[node_id]
+                    self._release_reservation(block_id, node_id)
+            if not targets:
+                del self.cluster.in_flight_replications[block_id]

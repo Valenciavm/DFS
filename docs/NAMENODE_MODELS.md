@@ -97,9 +97,9 @@ classDiagram
 - All models are `@dataclass`. Mutable defaults always use `field(default_factory=...)`; a bare `= []` or `= {}` is a bug (shared between instances).
 - Timestamps are **UTC wall-clock** `float` seconds since epoch (`time.time()`), because they are persisted. Liveness checks use a **monotonic** clock kept separately (`last_seen_monotonic` in `ClusterState`), never `time.time()`, so clock jumps cannot kill nodes.
 - Ids are opaque strings. Nobody except the NameNode parses them.
-- Addresses are `host:port` (no scheme): gRPC targets, as in `API.md` §1.
+- Addresses are `host:port` (no scheme): gRPC targets, as in `API.md` Section 1.
 - Sizes are in bytes (`int`).
-- Models contain data and tiny derived helpers only. Rules (placement, quorum, re-replication) live in the NameNode core (`ARCHITECTURE.md` §4.3, §6).
+- Models contain data and tiny derived helpers only. Rules (placement, quorum, re-replication) live in the NameNode core (`ARCHITECTURE.md` Sections 4.3 and 6).
 
 ---
 
@@ -140,7 +140,7 @@ The whole logical file.
 
 | Field | Type | Description |
 |---|---|---|
-| `file_id` | `str` | Unique id assigned at `put` (UUID vs prefixed id is open decision in `ARCHITECTURE.md` §16) |
+| `file_id` | `str` | Unique id assigned at `put` (UUID vs prefixed id is open decision in `ARCHITECTURE.md` Section 16) |
 | `name` | `str` | Name inside its directory. The full path is computed from the parent chain |
 | `owner` | `str` | Username from the authenticated principal |
 | `size_bytes` | `int` | Declared size; verified against the sum of block sizes at `commit` |
@@ -226,7 +226,7 @@ If every directory and file stored its full path, moving a directory would requi
 | `is_alive` | `bool` | Set by `monitor_datanodes` after `DEAD_NODE_TIMEOUT_S` without a heartbeat |
 
 Derived: `free_bytes() = max(0, capacity_bytes - used_bytes)`.
-(The earlier `address` field is split into `internal_addr` / `public_addr`, see `API.md` §1.)
+(The earlier `address` field is split into `internal_addr` / `public_addr`, see `API.md` Section 1.)
 
 ### 6.2 `ClusterState`
 
@@ -243,7 +243,7 @@ Everything the leader learns from DataNodes. Lost on failover by design; rebuilt
 
 Pipeline vs replicas is the key distinction: a block with 3 nodes in `pipelines` and 2 in `replicas` has been written to 2 nodes so far. `commit` succeeds when `len(replicas[block]) >= MIN_REPLICAS_COMMIT` for **every** block.
 
-Concurrency: all mutations happen on the event loop or under one lock; background tasks iterate over **snapshots** (`list(d.items())`), never the live dict (`ARCHITECTURE.md` §4.4).
+Concurrency: all mutations happen on the event loop or under one lock; background tasks iterate over **snapshots** (`list(d.items())`), never the live dict (`ARCHITECTURE.md` Section 4.4).
 
 ---
 
@@ -258,7 +258,7 @@ Concurrency: all mutations happen on the event loop or under one lock; backgroun
 | pipeline (soft) | `pipeline` in the `prepare` / `tokens` response, built from `internal_addr` | none |
 | `DataNodeInfo` | register / heartbeat payloads | none |
 
-Note what goes to the client: block locations use `public_addr`; the pipeline inside the write header uses `internal_addr` (`API.md` §1, §6.2).
+Note what goes to the client: block locations use `public_addr`; the pipeline inside the write header uses `internal_addr` (`API.md` Sections 1 and 6.2).
 
 ---
 
@@ -273,6 +273,6 @@ Note what goes to the client: block locations use `public_addr`; the pipeline in
 | 5 | `MetadataStore` held `datanodes` | `ClusterState` holds them | Keeps the persisted interface limited to hard state |
 | 6 | `DataNodeInfo.address` | `internal_addr` + `public_addr` + monotonic `last_seen_monotonic` | gRPC block channel, clients vs DataNodes, clock safety |
 | 7 | `@dataclass` and indexes listed as "future recommendations" | Mandatory (Sections 2 and 4.4) | Avoids shared-mutable-default bugs; indexes are required for block reports |
-| 8 | In-memory only | `MetadataStore` interface with PostgreSQL as the real implementation; in-memory fake for tests | High availability is part of the design from the start (`ARCHITECTURE.md` §5.2) |
+| 8 | In-memory only | `MetadataStore` interface with PostgreSQL as the real implementation; in-memory fake for tests | High availability is part of the design from the start (`ARCHITECTURE.md` Section 5.2) |
 
-Open points that still affect these models are tracked in `ARCHITECTURE.md` §16 (namespace per user vs ACL sharing, `file_id` format).
+Open points that still affect these models are tracked in `ARCHITECTURE.md` Section 16 (namespace per user vs ACL sharing, `file_id` format).

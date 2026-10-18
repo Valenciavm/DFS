@@ -12,6 +12,12 @@ pydantic==2.14.1
 # --- NameNode: metadata store (PostgreSQL, hard state) ---
 psycopg[binary]==3.3.6
 
+# --- NameNode: authentication (passwords, JWT, TOTP 2FA) ---
+argon2-cffi==25.1.0
+pyjwt==2.12.1
+pyotp==2.9.0
+qrcode[pil]==8.2
+
 # --- Client and DataNode: HTTP and gRPC block channel ---
 httpx==0.28.1
 grpcio==1.84.0

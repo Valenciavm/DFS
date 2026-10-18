@@ -16,7 +16,7 @@ Tests override by building their own instance::
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 KiB = 1024
 MiB = 1024 * KiB
@@ -75,9 +75,19 @@ class Settings:
     # --- paging ---
     ls_default_limit: int = 1000
 
+    # --- authentication (API.md Section 4.1) ---
+    #: JWT access-token lifetime. Intentionally distinct from token_ttl_s,
+    #: which is for gRPC block tokens.
+    jwt_ttl_s: int = 3600
+
     # --- secrets (never defaulted to a usable value) ---
-    block_token_secret: str = ""
-    node_key: str = ""
+    block_token_secret: str = field(default="", repr=False)
+    node_key: str = field(default="", repr=False)
+    #: Signs JWT access tokens (HS256). Must be set before the REST layer starts.
+    jwt_secret: str = field(default="", repr=False)
+    #: First admin bootstrapped on first start (ARCHITECTURE.md Section 9).
+    admin_user: str = ""
+    admin_password: str = field(default="", repr=False)
 
     def __post_init__(self) -> None:
         self.validate()
@@ -114,6 +124,8 @@ class Settings:
             )
         if self.lease_s <= 1:
             raise ConfigError(f"LEASE_S ({self.lease_s}) is too short to be renewed reliably")
+        if self.jwt_ttl_s <= 0:
+            raise ConfigError("JWT_TTL_S must be a positive number of seconds")
 
     @property
     def lease_renew_interval_s(self) -> float:
@@ -151,6 +163,10 @@ def load_settings() -> Settings:
         ls_default_limit=_env_int("LS_DEFAULT_LIMIT", 1000),
         block_token_secret=_env_str("BLOCK_TOKEN_SECRET", ""),
         node_key=_env_str("NODE_KEY", ""),
+        jwt_ttl_s=_env_int("JWT_TTL_S", 3600),
+        jwt_secret=_env_str("JWT_SECRET", ""),
+        admin_user=_env_str("ADMIN_USER", ""),
+        admin_password=_env_str("ADMIN_PASSWORD", ""),
     )
 
 

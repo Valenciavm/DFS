@@ -15,11 +15,18 @@ from each other.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import random
 import re
+import secrets
 import uuid
 from collections.abc import Callable
+from functools import wraps
+from inspect import signature
+from typing import Concatenate, ParamSpec, TypeVar
+
+from argon2 import PasswordHasher
 
 from server.common.clock import Clock, SystemClock
 from server.common.config import ConfigError, Settings
@@ -28,7 +35,18 @@ from server.common.errors import DfshaError, ErrorCode
 from server.common.paths import join_path, split_path
 from server.common.tokens import SYSTEM_PRINCIPAL, BlockOp, mint
 from server.nodes.namenode import placement
+from server.nodes.namenode.auth_context import current_principal
+from server.nodes.namenode.auth_models import (
+    AclEntry,
+    ApiKey,
+    AuditEntry,
+    Group,
+    Permission,
+    User,
+)
+from server.nodes.namenode.auth_store import AuthStore, InMemoryAuthStore
 from server.nodes.namenode.cluster_state import ClusterState, Command, DataNodeInfo
+from server.nodes.namenode.jwt_auth import issue_jwt, verify_jwt
 from server.nodes.namenode.models import (
     BlockMetadata,
     DirectoryMetadata,
@@ -54,6 +72,46 @@ from server.nodes.namenode.store import (
 
 logger = logging.getLogger(__name__)
 
+P = ParamSpec("P")
+R = TypeVar("R")
+
+
+def _audited_fs_operation(
+    method: Callable[Concatenate[Namenode, P], R],
+) -> Callable[Concatenate[Namenode, P], R]:
+    """Record every filesystem operation outcome without hiding its exception."""
+    method_signature = signature(method)
+
+    @wraps(method)
+    def wrapped(self: Namenode, *args: P.args, **kwargs: P.kwargs) -> R:
+        bound = method_signature.bind(self, *args, **kwargs)
+        bound.apply_defaults()
+        requested_user = bound.arguments.get("user")
+        username = requested_user if isinstance(requested_user, str) else "unknown"
+        if requested_user is None:
+            try:
+                username = current_principal()
+            except DfshaError:
+                pass
+        path = bound.arguments.get("path", bound.arguments.get("file_id"))
+        audit_path = path if isinstance(path, str) else None
+        if audit_path is not None and "file_id" in bound.arguments:
+            file = self.store.get_file_by_id(audit_path)
+            audit_path = self.store.path_of(file.file_id) if file is not None else None
+        try:
+            result = method(self, *args, **kwargs)
+        except DfshaError as error:
+            self._audit(username, method.__name__, audit_path, error.code.value)
+            raise
+        except Exception:
+            self._audit(username, method.__name__, audit_path, "INTERNAL")
+            raise
+        self._audit(username, method.__name__, audit_path, "OK")
+        return result
+
+    return wrapped
+
+
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 
 #: A copy that has not been confirmed after this long is given up on, so one lost
@@ -75,21 +133,348 @@ class Namenode:
         store: MetadataStore | None = None,
         clock: Clock | None = None,
         rng: random.Random | None = None,
+        auth_store: AuthStore | None = None,
     ) -> None:
         self.settings = settings if settings is not None else default_settings
         if not self.settings.block_token_secret:
             # fail at startup: a NameNode without it would issue tokens nobody can verify
             raise ConfigError("BLOCK_TOKEN_SECRET must be set: block tokens are signed with it")
+        if not self.settings.jwt_secret:
+            raise ConfigError("JWT_SECRET must be set: access tokens are signed with it")
         self.clock: Clock = clock if clock is not None else SystemClock()
         self.rng = rng if rng is not None else random.Random()
         self.store: MetadataStore = (
             store if store is not None else InMemoryMetadataStore(now=self.clock.time())
         )
+        self.auth_store: AuthStore = auth_store if auth_store is not None else InMemoryAuthStore()
+        self._password_hasher = PasswordHasher()
         self.cluster = ClusterState()
         #: leadership generation; fixed at 1 until the lease is implemented
         self.term = 1
         #: monotonic instant until which nobody is declared dead after a failover
         self._grace_until = 0.0
+        if bool(self.settings.admin_user) != bool(self.settings.admin_password):
+            raise ConfigError("ADMIN_USER and ADMIN_PASSWORD must be configured together")
+        if self.settings.admin_user and not self.auth_store.users():
+            if len(self.settings.admin_password) < 8:
+                raise ConfigError("ADMIN_PASSWORD must contain at least 8 characters")
+            admin_home = f"/users/{self.settings.admin_user}"
+            try:
+                valid_admin_path = len(split_path(admin_home)) == 2
+            except DfshaError:
+                valid_admin_path = False
+            if not valid_admin_path:
+                raise ConfigError("ADMIN_USER must be a valid single path segment")
+            self.auth_store.create_user(
+                User(
+                    username=self.settings.admin_user,
+                    password_hash=self._password_hasher.hash(self.settings.admin_password),
+                    role="admin",
+                    created_at=self.clock.time(),
+                )
+            )
+            self.store.mkdir(admin_home, self.settings.admin_user, self.clock.time(), parents=True)
+
+    # ---- authentication, groups and ACLs --------------------------------
+
+    def _actor(self, user: str | None) -> User:
+        try:
+            username = user if user is not None else current_principal()
+        except DfshaError:
+            self._audit("unknown", "authenticate_principal", None, "UNAUTHORIZED")
+            raise
+        account = self.auth_store.get_user(username)
+        if account is None:
+            self._audit(username, "authenticate_principal", None, "UNAUTHORIZED")
+            raise DfshaError(ErrorCode.UNAUTHORIZED, "unknown authenticated user")
+        return account
+
+    def _audit(
+        self,
+        user: str,
+        operation: str,
+        path: str | None,
+        result: str,
+        request_id: str | None = None,
+    ) -> None:
+        self.auth_store.audit(
+            AuditEntry(self.clock.time(), user, operation, path, result, request_id)
+        )
+
+    def register_user(self, username: str, password: str) -> dict[str, str]:
+        """Create a password-authenticated account with the default user role."""
+        if not isinstance(username, str) or not username or username.strip() != username:
+            self._audit("unknown", "register", None, "BAD_REQUEST")
+            raise DfshaError(ErrorCode.BAD_REQUEST, "username must be a non-empty trimmed string")
+        try:
+            username_parts = split_path(f"/{username}")
+        except DfshaError:
+            self._audit(username, "register", None, "BAD_REQUEST")
+            raise DfshaError(ErrorCode.BAD_REQUEST, "username must be a valid path segment") from None
+        if username_parts != [username]:
+            self._audit(username, "register", None, "BAD_REQUEST")
+            raise DfshaError(ErrorCode.BAD_REQUEST, "username must be a valid path segment")
+        if not isinstance(password, str) or len(password) < 8:
+            self._audit(username, "register", None, "BAD_REQUEST")
+            raise DfshaError(ErrorCode.BAD_REQUEST, "password must contain at least 8 characters")
+        if self.auth_store.get_user(username) is not None:
+            self._audit(username, "register", None, "ALREADY_EXISTS")
+            raise DfshaError(ErrorCode.ALREADY_EXISTS, f"user {username} already exists")
+        home = f"/users/{username}"
+        if self.store.stat(home) is not None or self.store.get_pending(home) is not None:
+            self._audit(username, "register", home, "ALREADY_EXISTS")
+            raise DfshaError(ErrorCode.ALREADY_EXISTS, f"home path for {username} already exists")
+        user = User(
+            username=username,
+            password_hash=self._password_hasher.hash(password),
+            role="user",
+            created_at=self.clock.time(),
+        )
+        self.auth_store.create_user(user)
+        self.store.mkdir(home, username, self.clock.time(), parents=True)
+        self._audit(username, "register", home, "OK")
+        return {"username": username}
+
+    def verify_password(self, username: str, password: str) -> bool:
+        """Verify credentials without revealing whether the account exists."""
+        if not isinstance(password, str):
+            return False
+        return self.auth_store.verify_password(username, password)
+
+    def login(self, username: str, password: str) -> dict[str, object]:
+        """Verify a password and return either an access token or the MFA branch."""
+        if not isinstance(username, str) or not isinstance(password, str):
+            self._audit(username if isinstance(username, str) else "unknown", "login", None, "UNAUTHORIZED")
+            raise DfshaError(ErrorCode.UNAUTHORIZED, "invalid username or password")
+        user = self.auth_store.get_user(username)
+        if user is None or not self.auth_store.verify_password(username, password):
+            self._audit(username, "login", None, "UNAUTHORIZED")
+            raise DfshaError(ErrorCode.UNAUTHORIZED, "invalid username or password")
+        if user.totp_enabled:
+            self._audit(username, "login", None, "MFA_REQUIRED")
+            raise NotImplementedError(
+                "TOTP verification is deferred to the security issue (ARCHITECTURE.md Section 9.1)"
+            )
+        token = issue_jwt(
+            username, self.settings.jwt_secret, self.settings.jwt_ttl_s, self.clock.time()
+        )
+        self._audit(username, "login", None, "OK")
+        return {
+            "access_token": token,
+            "token_type": "bearer",
+            "expires_in": self.settings.jwt_ttl_s,
+        }
+
+    def authenticate_access_token(self, token: str) -> User:
+        try:
+            claims = verify_jwt(token, self.settings.jwt_secret, self.clock.time())
+        except DfshaError:
+            self._audit("unknown", "authenticate_access_token", None, "UNAUTHORIZED")
+            raise
+        user = self.auth_store.get_user(str(claims["sub"]))
+        if user is None:
+            self._audit(str(claims["sub"]), "authenticate_access_token", None, "UNAUTHORIZED")
+            raise DfshaError(ErrorCode.UNAUTHORIZED, "access token subject no longer exists")
+        self._audit(user.username, "authenticate_access_token", None, "OK")
+        return user
+
+    def authenticate_api_key(self, raw_key: str) -> User:
+        """Validate a high-entropy API key through its stored SHA-256 digest."""
+        digest = hashlib.sha256(raw_key.encode("utf-8")).hexdigest() if isinstance(raw_key, str) else ""
+        matched = self.auth_store.get_api_key_by_hash(digest) if digest else None
+        if matched is not None and matched.revoked_at is not None:
+            matched = None
+        if matched is None:
+            self._audit("unknown", "authenticate_api_key", None, "UNAUTHORIZED")
+            raise DfshaError(ErrorCode.UNAUTHORIZED, "invalid or revoked API key")
+        user = self.auth_store.get_user(matched.user_id)
+        if user is None:
+            raise DfshaError(ErrorCode.UNAUTHORIZED, "API key owner no longer exists")
+        self._audit(user.username, "authenticate_api_key", None, "OK")
+        return user
+
+    def create_api_key(self, name: str, user: str | None = None) -> dict[str, object]:
+        actor = self._actor(user)
+        if not isinstance(name, str) or not name.strip():
+            self._audit(actor.username, "create_api_key", None, "BAD_REQUEST")
+            raise DfshaError(ErrorCode.BAD_REQUEST, "API key name is required")
+        key_id = f"k_{uuid.uuid4().hex[:12]}"
+        raw_key = f"dfsha_live_{key_id}.{secrets.token_urlsafe(32)}"
+        key = ApiKey(
+            key_id=key_id,
+            user_id=actor.username,
+            name=name.strip(),
+            key_hash=hashlib.sha256(raw_key.encode("utf-8")).hexdigest(),
+            created_at=self.clock.time(),
+        )
+        self.auth_store.create_api_key(key)
+        self._audit(actor.username, "create_api_key", None, "OK")
+        return {
+            "key_id": key.key_id,
+            "name": key.name,
+            "api_key": raw_key,
+            "created_at": key.created_at,
+        }
+
+    def list_api_keys(self, user: str | None = None) -> list[dict[str, object]]:
+        actor = self._actor(user)
+        self._audit(actor.username, "list_api_keys", None, "OK")
+        return [
+            {
+                "key_id": key.key_id,
+                "name": key.name,
+                "created_at": key.created_at,
+                "revoked_at": key.revoked_at,
+            }
+            for key in self.auth_store.list_api_keys(actor.username)
+        ]
+
+    def revoke_api_key(self, key_id: str, user: str | None = None) -> None:
+        actor = self._actor(user)
+        key = self.auth_store.get_api_key(key_id)
+        if key is None or key.user_id != actor.username:
+            self._audit(actor.username, "revoke_api_key", None, "FORBIDDEN")
+            raise DfshaError(ErrorCode.FORBIDDEN, "API key does not belong to this user")
+        self.auth_store.revoke_api_key(key_id, self.clock.time())
+        self._audit(actor.username, "revoke_api_key", None, "OK")
+
+    def create_group(self, name: str, user: str | None = None) -> Group:
+        actor = self._actor(user)
+        if not isinstance(name, str) or not name or name.strip() != name:
+            self._audit(actor.username, "create_group", None, "BAD_REQUEST")
+            raise DfshaError(ErrorCode.BAD_REQUEST, "group name must be non-empty")
+        if self.auth_store.get_group(name) is not None:
+            self._audit(actor.username, "create_group", None, "ALREADY_EXISTS")
+            raise DfshaError(ErrorCode.ALREADY_EXISTS, f"group {name} already exists")
+        group = Group(name=name, owner=actor.username, members={actor.username})
+        self.auth_store.create_group(group)
+        self._audit(actor.username, "create_group", None, "OK")
+        return group
+
+    def add_group_members(
+        self,
+        name: str,
+        add: list[str],
+        remove: list[str],
+        user: str | None = None,
+    ) -> Group:
+        actor = self._actor(user)
+        group = self.auth_store.get_group(name)
+        if group is None:
+            self._audit(actor.username, "update_group_members", None, "GROUP_NOT_FOUND")
+            raise DfshaError(ErrorCode.GROUP_NOT_FOUND, f"group {name} does not exist")
+        if group.owner != actor.username:
+            self._audit(actor.username, "update_group_members", None, "FORBIDDEN")
+            raise DfshaError(ErrorCode.FORBIDDEN, "only the group owner may change membership")
+        if (
+            not isinstance(add, list)
+            or not isinstance(remove, list)
+            or any(not isinstance(username, str) or not username for username in [*add, *remove])
+        ):
+            self._audit(actor.username, "update_group_members", None, "BAD_REQUEST")
+            raise DfshaError(ErrorCode.BAD_REQUEST, "add and remove must be lists of usernames")
+        members = set(group.members)
+        for username in add:
+            if self.auth_store.get_user(username) is None:
+                self._audit(actor.username, "update_group_members", None, "USER_NOT_FOUND")
+                raise DfshaError(ErrorCode.USER_NOT_FOUND, f"user {username} does not exist")
+            members.add(username)
+        members.difference_update(remove)
+        updated = self.auth_store.update_group_members(name, members)
+        self._audit(actor.username, "update_group_members", None, "OK")
+        return updated
+
+    def get_group(self, name: str, user: str | None = None) -> Group:
+        actor = self._actor(user)
+        group = self.auth_store.get_group(name)
+        if group is None:
+            self._audit(actor.username, "get_group", None, "GROUP_NOT_FOUND")
+            raise DfshaError(ErrorCode.GROUP_NOT_FOUND, f"group {name} does not exist")
+        if group.owner != actor.username and actor.username not in group.members:
+            self._audit(actor.username, "get_group", None, "FORBIDDEN")
+            raise DfshaError(ErrorCode.FORBIDDEN, "only group members may view group details")
+        self._audit(actor.username, "get_group", None, "OK")
+        return group
+
+    def effective_permission(self, username: str, path: str) -> Permission:
+        """Union grants along ancestors; a closer `none` masks inherited grants."""
+        canonical = join_path(split_path(path))
+        node = self.store.stat(canonical)
+        if node is not None and node.owner == username:
+            return Permission.READ_WRITE
+        memberships = {group.name for group in self.auth_store.groups() if username in group.members}
+        permission = Permission.NONE
+        for candidate in self._path_ancestors(canonical):
+            matches = [
+                entry
+                for entry in self.auth_store.get_acl(candidate)
+                if (
+                    entry.subject == f"user:{username}"
+                    or entry.subject in {f"group:{name}" for name in memberships}
+                )
+            ]
+            if matches:
+                if any(entry.permission is Permission.NONE for entry in matches):
+                    return permission
+                permission = max(permission, *(entry.permission for entry in matches))
+        return permission
+
+    @staticmethod
+    def _path_ancestors(path: str) -> list[str]:
+        parts = split_path(path)
+        return [join_path(parts[:index]) for index in range(len(parts), -1, -1)]
+
+    @_audited_fs_operation
+    def set_acl(
+        self,
+        path: str,
+        subject: str,
+        permission: str,
+        user: str | None = None,
+    ) -> AclEntry:
+        actor = self._actor(user)
+        canonical = join_path(split_path(path))
+        node = self.store.stat(canonical)
+        if node is None:
+            parent_path = join_path(split_path(canonical)[:-1])
+            self._require_permission(actor.username, parent_path, Permission.READ)
+            raise DfshaError(ErrorCode.FILE_NOT_FOUND, f"{canonical} does not exist")
+        if node.owner != actor.username:
+            raise DfshaError(ErrorCode.FORBIDDEN, "only the path owner may change its ACL")
+        if not isinstance(subject, str):
+            raise DfshaError(ErrorCode.BAD_REQUEST, "subject must be user:<name> or group:<name>")
+        kind, separator, name = subject.partition(":")
+        if not separator or kind not in {"user", "group"} or not name:
+            raise DfshaError(ErrorCode.BAD_REQUEST, "subject must be user:<name> or group:<name>")
+        if kind == "user" and self.auth_store.get_user(name) is None:
+            raise DfshaError(ErrorCode.USER_NOT_FOUND, f"user {name} does not exist")
+        if kind == "group" and self.auth_store.get_group(name) is None:
+            raise DfshaError(ErrorCode.GROUP_NOT_FOUND, f"group {name} does not exist")
+        try:
+            parsed = Permission.parse(permission)
+        except (TypeError, ValueError) as error:
+            raise DfshaError(ErrorCode.BAD_REQUEST, str(error)) from None
+        entry = AclEntry(canonical, subject, parsed)
+        self.auth_store.set_acl(entry)
+        return entry
+
+    @_audited_fs_operation
+    def get_acl(self, path: str, user: str | None = None) -> list[AclEntry]:
+        actor = self._actor(user)
+        canonical = join_path(split_path(path))
+        if self.store.stat(canonical) is None:
+            raise DfshaError(ErrorCode.FILE_NOT_FOUND, f"{canonical} does not exist")
+        self._require_permission(actor.username, canonical, Permission.READ)
+        return self.auth_store.get_acl(canonical)
+
+    def _require_permission(
+        self,
+        username: str,
+        path: str,
+        required: Permission,
+    ) -> None:
+        if self.effective_permission(username, path) < required:
+            raise DfshaError(ErrorCode.FORBIDDEN, f"{username} lacks permission on {path}")
 
     # ---- DataNode registry and liveness ----------------------------------
 
@@ -200,8 +585,14 @@ class Namenode:
 
     # ---- uploads ---------------------------------------------------------
 
+    @_audited_fs_operation
     def prepare_file_upload(
-        self, path: str, size_bytes: int, owner: str, overwrite: bool = False
+        self,
+        path: str,
+        size_bytes: int,
+        owner: str,
+        overwrite: bool = False,
+        user: str | None = None,
     ) -> UploadPlan:
         """Step 1 of ``put`` (``ARCHITECTURE.md`` Section 4.3).
 
@@ -210,6 +601,7 @@ class Namenode:
         counts as a replica until a DataNode confirms it.
         """
         s = self.settings
+        actor = self._actor(user)
         segments = split_path(path)
         if not segments:
             raise DfshaError(ErrorCode.IS_A_DIRECTORY, "/ is a directory")
@@ -223,7 +615,11 @@ class Namenode:
             )
         if not owner:
             raise DfshaError(ErrorCode.BAD_REQUEST, "an upload needs an owner")
-        self.store.resolve_dir(join_path(segments[:-1]))  # DIR_NOT_FOUND / NOT_A_DIRECTORY
+        if owner != actor.username:
+            raise DfshaError(ErrorCode.FORBIDDEN, "an upload owner must be the authenticated user")
+        parent_path = join_path(segments[:-1])
+        self.store.resolve_dir(parent_path)  # DIR_NOT_FOUND / NOT_A_DIRECTORY
+        self._require_permission(actor.username, parent_path, Permission.READ_WRITE)
 
         now = self.clock.time()
         pending = self.store.get_pending(path)
@@ -273,11 +669,13 @@ class Namenode:
             planned.append(PlannedBlock(block=block, pipeline=chosen, token=token))
         return UploadPlan(file=file, path=path, blocks=planned)
 
+    @_audited_fs_operation
     def commit_file_upload(
         self,
         file_id: str,
         blocks: list[CommittedBlock],
         file_checksum: str | None = None,
+        user: str | None = None,
     ) -> FileMetadata:
         """Step 3 of ``put`` (``ARCHITECTURE.md`` Section 4.3, ``API.md`` Section 5.2).
 
@@ -287,9 +685,12 @@ class Namenode:
         it is checked against confirmations, never against the planned pipeline.
         """
         s = self.settings
+        actor = self._actor(user)
         file = self.store.get_file_by_id(file_id)
         if file is None:
             raise DfshaError(ErrorCode.FILE_NOT_FOUND, f"no upload with id {file_id}")
+        if file.owner != actor.username:
+            raise DfshaError(ErrorCode.FORBIDDEN, "only the upload owner may commit it")
         now = self.clock.time()
 
         if file.status is FileStatus.COMMITTED:
@@ -340,10 +741,16 @@ class Namenode:
             self._schedule_deletion(replaced.blocks)
         return file
 
-    def abort_file_upload(self, file_id: str) -> None:
+    @_audited_fs_operation
+    def abort_file_upload(self, file_id: str, user: str | None = None) -> None:
         """Cancels a pending upload. Idempotent (``API.md`` Section 5.6)."""
+        actor = self._actor(user)
         file = self.store.get_file_by_id(file_id)
-        if file is None or file.status is FileStatus.ABORTED:
+        if file is None:
+            return
+        if file.owner != actor.username:
+            raise DfshaError(ErrorCode.FORBIDDEN, "only the upload owner may abort it")
+        if file.status is FileStatus.ABORTED:
             return
         if file.status is FileStatus.COMMITTED:
             raise DfshaError(ErrorCode.BAD_REQUEST, "the file is already committed; remove it instead")
@@ -514,6 +921,7 @@ class Namenode:
 
     # ---- reading ---------------------------------------------------------
 
+    @_audited_fs_operation
     def get_file_blocks(self, path: str, user: str) -> FileLocation:
         """Step 1 of ``get`` (``API.md`` Section 5.3): the block map of a committed file.
 
@@ -524,10 +932,14 @@ class Namenode:
         """
         if not user:
             raise DfshaError(ErrorCode.BAD_REQUEST, "a read needs a user")
+        actor = self._actor(user)
         canonical = join_path(split_path(path))
         node = self.store.stat(canonical)
         if node is None:
+            parent_path = join_path(split_path(canonical)[:-1])
+            self._require_permission(actor.username, parent_path, Permission.READ)
             raise DfshaError(ErrorCode.FILE_NOT_FOUND, f"{canonical} does not exist")
+        self._require_permission(actor.username, canonical, Permission.READ)
         if isinstance(node, DirectoryMetadata):
             raise DfshaError(ErrorCode.IS_A_DIRECTORY, f"{canonical} is a directory")
 
@@ -545,30 +957,72 @@ class Namenode:
 
     # ---- file system operations (RF1) -------------------------------------
 
-    def mkdir(self, path: str, owner: str, parents: bool = False) -> DirectoryMetadata:
+    @_audited_fs_operation
+    def mkdir(
+        self,
+        path: str,
+        owner: str,
+        parents: bool = False,
+        user: str | None = None,
+    ) -> DirectoryMetadata:
+        actor = self._actor(user)
         if not owner:
             raise DfshaError(ErrorCode.BAD_REQUEST, "a directory needs an owner")
-        return self.store.mkdir(path, owner, self.clock.time(), parents=parents)
+        if owner != actor.username:
+            raise DfshaError(ErrorCode.FORBIDDEN, "a directory owner must be the authenticated user")
+        segments = split_path(path)
+        if not segments:
+            return self.store.mkdir(path, actor.username, self.clock.time(), parents=parents)
+        parent_path = join_path(segments[:-1])
+        if parents:
+            while self.store.stat(parent_path) is None and parent_path != "/":
+                parent_path = join_path(split_path(parent_path)[:-1])
+        self._require_permission(actor.username, parent_path, Permission.READ_WRITE)
+        return self.store.mkdir(path, actor.username, self.clock.time(), parents=parents)
 
-    def ls(self, path: str) -> list[DirEntry]:
-        return self.store.list_dir(path)
+    @_audited_fs_operation
+    def ls(self, path: str, user: str | None = None) -> list[DirEntry]:
+        actor = self._actor(user)
+        canonical = join_path(split_path(path))
+        self._require_permission(actor.username, canonical, Permission.READ)
+        return self.store.list_dir(canonical)
 
-    def stat(self, path: str) -> DirectoryMetadata | FileMetadata:
-        node = self.store.stat(path)
+    @_audited_fs_operation
+    def stat(self, path: str, user: str | None = None) -> DirectoryMetadata | FileMetadata:
+        actor = self._actor(user)
+        canonical = join_path(split_path(path))
+        node = self.store.stat(canonical)
         if node is None:
-            raise DfshaError(ErrorCode.FILE_NOT_FOUND, f"{join_path(split_path(path))} does not exist")
+            parent_path = join_path(split_path(canonical)[:-1])
+            self._require_permission(actor.username, parent_path, Permission.READ)
+            raise DfshaError(ErrorCode.FILE_NOT_FOUND, f"{canonical} does not exist")
+        self._require_permission(actor.username, canonical, Permission.READ)
         return node
 
-    def rm(self, path: str) -> FileMetadata:
+    @_audited_fs_operation
+    def rm(self, path: str, user: str | None = None) -> FileMetadata:
         """Removes a file. It vanishes from ``ls`` at once; its blocks are deleted
         afterwards through ``delete`` commands (``API.md`` Section 4.3)."""
-        file = self.store.remove_file(path, self.clock.time())
+        actor = self._actor(user)
+        canonical = join_path(split_path(path))
+        parent_path = join_path(split_path(canonical)[:-1])
+        self._require_permission(actor.username, parent_path, Permission.READ_WRITE)
+        file = self.store.remove_file(canonical, self.clock.time())
+        self.auth_store.remove_acl_subtree(canonical)
         self._schedule_deletion(file.blocks)
         return file
 
-    def rmdir(self, path: str, recursive: bool = False) -> int:
+    @_audited_fs_operation
+    def rmdir(
+        self, path: str, recursive: bool = False, user: str | None = None
+    ) -> int:
         """Removes a directory and returns how many files went with it."""
-        removed = self.store.remove_dir(path, recursive, self.clock.time())
+        actor = self._actor(user)
+        canonical = join_path(split_path(path))
+        parent_path = join_path(split_path(canonical)[:-1])
+        self._require_permission(actor.username, parent_path, Permission.READ_WRITE)
+        removed = self.store.remove_dir(canonical, recursive, self.clock.time())
+        self.auth_store.remove_acl_subtree(canonical)
         for file in removed:
             self._schedule_deletion(file.blocks)
         return len(removed)

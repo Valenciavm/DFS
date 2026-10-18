@@ -26,6 +26,10 @@ def test_defaults_match_the_contract():
     assert s.lease_s == 15
     assert s.failover_grace_s == 30
     assert s.ls_default_limit == 1000
+    assert s.jwt_ttl_s == 3600
+    assert s.jwt_secret == ""
+    assert s.admin_user == ""
+    assert s.admin_password == ""
 
 
 def test_secrets_have_no_usable_default():
@@ -39,10 +43,23 @@ def test_environment_overrides_are_applied(monkeypatch):
     monkeypatch.setenv("BLOCK_SIZE", str(1 * MiB))   # the demo profile
     monkeypatch.setenv("REPLICATION_FACTOR", "5")
     monkeypatch.setenv("BLOCK_TOKEN_SECRET", "s3cret")
+    monkeypatch.setenv("JWT_TTL_S", "1800")
+    monkeypatch.setenv("JWT_SECRET", "jwt-secret")
+    monkeypatch.setenv("ADMIN_USER", "root")
+    monkeypatch.setenv("ADMIN_PASSWORD", "admin-password")
     s = load_settings()
     assert s.block_size == 1 * MiB
     assert s.replication_factor == 5
     assert s.block_token_secret == "s3cret"
+    assert s.jwt_ttl_s == 1800
+    assert s.jwt_secret == "jwt-secret"
+    assert s.admin_user == "root"
+    assert s.admin_password == "admin-password"
+
+
+def test_jwt_lifetime_must_be_positive():
+    with pytest.raises(ConfigError, match="JWT_TTL_S"):
+        Settings(jwt_ttl_s=0)
 
 
 def test_a_malformed_value_is_rejected_rather_than_ignored(monkeypatch):

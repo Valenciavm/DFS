@@ -6,9 +6,9 @@ first heading is the proposed title. The drafts include context, dependencies,
 implementation requirements, tests and an acceptance checklist so another
 agent can continue without this conversation.
 
-> **Terminology:** `Issue 01`–`Issue 10` below are the project-work issues in
-> this folder. `PR #1`–`PR #4` are the pull requests currently open in GitHub.
-> They are different numbering systems.
+> **Terminology:** numbered issue files are project-work drafts; pull request
+> numbers are GitHub references. Completed work is listed separately below and
+> is not an outstanding issue.
 
 ## How to work from an issue
 
@@ -36,51 +36,53 @@ agent can continue without this conversation.
 
 ## Current baseline
 
-The current implementation baseline is the tip of `feat/namenode-core-rewrite`
-(PR #4): the NameNode core has an in-memory `MetadataStore`, weighted placement,
+The current `main` baseline includes merged PRs #1–#4 and #6. It has the
+NameNode core, an in-memory `MetadataStore`, weighted placement,
 WORM upload/commit/abort, read maps, block reports, re-replication, garbage
-collection, stats and background loops. The integrated gRPC DataNode is in the
-lower PRs. The baseline is verified at **350 passing tests** with `ruff check .`
-clean.
+collection, stats and background loops. The DataNode pipeline recovery,
+ranged reads, idempotent writes and gRPC block-token interceptor are included
+in PR #6.
 
 Important known gaps at this baseline: no REST layer, no PostgreSQL store, no
-leader lease/second NameNode, no enforced auth/ACL yet, no TLS/mTLS or encrypted
-at-rest blocks, no complete DataNode control loop, no client library/CLI and no
-Compose/cloud deployment. The issues below are ordered to close those gaps;
-they are not claims that the features already exist.
+leader lease/second NameNode, no TLS/mTLS or encrypted at-rest blocks, no
+complete DataNode control loop, no client library/CLI and no Compose/cloud
+deployment. The auth/ACL core is implemented in this branch and will be delivered by PR #7;
+it is not part of the current `main` baseline until that pull request is
+merged.
 
 ## Current PR stack
 
 ```text
 main
- └─ PR #1  chore/integrate-data-plane            (gRPC data plane ported)
-     └─ PR #2  docs/align-with-deliverable-spec (contract/rubric alignment)
-         └─ PR #3  feat/server-common           (config, errors, block tokens)
-             └─ PR #4  feat/namenode-core-rewrite (NameNode core rewrite)
+ ├─ PRs #1–#4  data plane, server common and NameNode core
+ └─ PR #6      DataNode pipeline recovery, ranged reads and block-token interceptor
 ```
 
-All four PRs were open at the time these drafts were created and should be
-reviewed/merged in that order. If their status changes, use the actual current
-branch/PR state rather than blindly copying the old stack.
+PRs #1–#4 and #6 are merged. PR #5 (a proposed revert of PR #1) was closed
+without merging and is not a completed deliverable. Check GitHub for current
+status rather than treating old draft branch names as active work.
 
 ## Issue roadmap
 
 | Issue | Draft | Depends on | Main deliverable | Unblocks |
 |---|---|---|---|---|
-| 01 | [`01-auth-and-acl.md`](01-auth-and-acl.md) | PR #4 | Users, Argon2 passwords, JWT/API keys, groups, ACL enforcement and audit hook | 02, 03 |
-| 02 | [`02-namenode-rest-api.md`](02-namenode-rest-api.md) | 01 | FastAPI adapter, contract errors, tracing, `mv`, locks, file/node/admin/HA routes | 04, 08 |
-| 03 | [`03-postgres-metadata-store.md`](03-postgres-metadata-store.md) | 01 | PostgreSQL hard-state store, migrations, local primary/standby and RDS plan | 06 |
+| 02 | [`02-namenode-rest-api.md`](02-namenode-rest-api.md) | PR #7 | FastAPI adapter, contract errors, tracing, `mv`, locks, file/node/admin/HA routes | 04, 08 |
+| 03 | [`03-postgres-metadata-store.md`](03-postgres-metadata-store.md) | PR #7 | PostgreSQL hard-state and auth stores, migrations, local primary/standby and RDS plan | 06 |
 | 04 | [`04-datanode-control-loop.md`](04-datanode-control-loop.md) | 02 | DataNode registration, heartbeats, reports, commands and retries | 08, 09 |
-| 05 | [`05-pipeline-resilience-and-ranged-reads.md`](05-pipeline-resilience-and-ranged-reads.md) | none; merge before 08 | Dead-hop recovery, ranged `ReadBlock`, `StatBlock`, idempotent writes | 08 |
 | 06 | [`06-ha-lease-and-second-namenode.md`](06-ha-lease-and-second-namenode.md) | 03 | PostgreSQL lease, fencing, second NameNode, failover and degraded mode | 09, 10 |
-| 07 | [`07-security-tls-and-encryption.md`](07-security-tls-and-encryption.md) | 01, 02, 04, 05 | TLS/mTLS, block interceptor, AES-256-GCM at rest, TOTP 2FA | 09, 10 |
-| 08 | [`08-client-library-and-cli.md`](08-client-library-and-cli.md) | 01, 02, 04, 05 | Python client, CLI, send/receive, put/get, open/read/lock and fallback | 09, 10 |
+| 07 | [`07-security-tls-and-encryption.md`](07-security-tls-and-encryption.md) | PR #7, 02, 04, PR #6 | TLS/mTLS, AES-256-GCM at rest, TOTP 2FA | 09, 10 |
+| 08 | [`08-client-library-and-cli.md`](08-client-library-and-cli.md) | PR #7, 02, 04, PR #6 | Python client, CLI, send/receive, put/get, open/read/lock and fallback | 09, 10 |
 | 09 | [`09-docker-compose-and-cloud-deploy.md`](09-docker-compose-and-cloud-deploy.md) | 06, 07, 08 | Five-DataNode Compose cluster, README, env/certs and AWS/GCP deployment | 10 |
 | 10 | [`10-test-plan-execution-and-report.md`](10-test-plan-execution-and-report.md) | 09 | T1–T24 evidence, benchmarks, final report and 10–15 minute video | final |
 
-Issues 01–07 are mostly server work and can be parallelized only after their
+Issues 02–07 are mostly server work and can be parallelized only after their
 listed dependencies exist. Issues 08–10 are integration work and should be
 done against a stable server/security baseline.
+
+## Completed work
+
+- Auth/ACL core: implemented in PR #7; pending merge into `main`.
+- DataNode pipeline resilience and ranged reads: merged in PR #6.
 
 ## Reference documents
 

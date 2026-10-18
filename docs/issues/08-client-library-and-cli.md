@@ -1,7 +1,7 @@
 # Python client library, CLI, transfer API and dynamic transparency
 
-**Depends on:** issue 02 (REST), issue 04 (DataNode control loop), issue 05
-(ranged/idempotent gRPC), and issue 01 (authentication). Issue 07 is needed
+**Depends on:** issue 02 (REST), issue 04 (DataNode control loop), PR #6
+(ranged/idempotent gRPC), and the auth/ACL core pull request. Issue 07 is needed
 before production TLS, but the client can use explicit local CA settings first.
 **Branch:** `feat/client-library-cli`, from the latest server branch.
 **Unblocks:** issue 09 and the end-to-end demonstrations.

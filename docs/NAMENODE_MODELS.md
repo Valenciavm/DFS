@@ -1,4 +1,4 @@
-# DFSha — NameNode Metadata Models (v0.4)
+# DFSha — NameNode Metadata Models (v0.5)
 
 Code-level reference for `server/nodes/namenode/models.py`. It complements [`ARCHITECTURE.md`](ARCHITECTURE.md) (Section 5 explains the design, this file gives the Python shape) and follows the contract in [`API.md`](API.md). If they disagree, `API.md` wins for what crosses the wire and `ARCHITECTURE.md` wins for design.
 
@@ -280,3 +280,41 @@ Note what goes to the client: block locations use `public_addr`; the pipeline in
 | 8 | In-memory only | `MetadataStore` interface with PostgreSQL as the real implementation; in-memory fake for tests | High availability is part of the design from the start (`ARCHITECTURE.md` Section 5.2) |
 
 Open points that still affect these models are tracked in `ARCHITECTURE.md` Section 16 (namespace per user vs ACL sharing, `file_id` format).
+
+---
+
+## 9. Authentication and access-control state
+
+Authentication data is a separate hard-state boundary, implemented by
+`AuthStore` alongside (not inside) `MetadataStore`. This keeps credentials,
+API keys, groups, ACLs and audit events out of the namespace persistence
+interface, while allowing issue 03 to provide a PostgreSQL implementation
+without coupling those records to block and inode operations. The current
+`InMemoryAuthStore` is for tests and development only; production persistence
+is deferred to issue 03.
+
+| Model | Stored fields | Purpose |
+|---|---|---|
+| `User` | username, Argon2 password hash, role, creation time, TOTP-enabled flag | Authentication and future MFA branch |
+| `ApiKey` | key id, owning username, name, SHA-256 digest of the 256-bit random key, creation/revocation times | Revocable long-lived credentials; plaintext is returned only once |
+| `Group` | name, owner username, member usernames | Group-based ACL matching |
+| `AclEntry` | canonical path, `user:<name>` / `group:<name>` subject, permission | Path ACL stored at the path where it is set |
+| `AuditEntry` | timestamp, user, operation, path, result, optional request id | Append-only audit hook for auth and filesystem decisions |
+
+`Permission` is ordered `NONE < READ < READ_WRITE`. The owner of the exact
+file or directory always has `READ_WRITE`; there is no implicit admin bypass
+for filesystem ACLs. ACL lookup unions matching user/group grants along the
+ancestor chain. A `none` at a more-specific path masks grants inherited from
+further ancestors; a grant on a child path can conversely override an ancestor
+`none`. Multiple entries applying at the same path are unioned unless one of
+them is `none`, in which case `none` denies at that specificity. The REST
+adapter must set the authenticated request principal before calling core
+operations; absent principals are rejected rather than treated as a trusted
+system user.
+
+The core's request-scoped principal context is only an adapter convenience;
+explicit `user` arguments take precedence. Auth records and group membership
+are returned as snapshots so a caller cannot mutate the store by changing a
+returned object. API-key material is generated with 256 bits of randomness, so
+its SHA-256 digest is used for indexed lookup rather than a slow password hash;
+passwords themselves use Argon2id through `argon2-cffi`.

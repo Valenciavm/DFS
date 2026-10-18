@@ -7,7 +7,7 @@ import grpc
 from proto import block_service_pb2 as pb2
 from proto import block_service_pb2_grpc as pb2_grpc
 from server.common.config import Settings, settings
-from server.nodes.datanode.block_service import BlockServiceImpl
+from server.nodes.datanode.block_service import BlockServiceImpl, BlockTokenInterceptor
 from server.nodes.datanode.storage import StorageManager
 
 # Configuración por defecto del DataNode
@@ -101,7 +101,9 @@ class DataNode:
 
     async def start_grpc_server(self):
         """Inicia el servidor gRPC asíncrono para atender WriteBlock y ReadBlock."""
-        self.grpc_server = grpc.aio.server()  # crea el servidor grpc asincrono
+        self.grpc_server = grpc.aio.server(
+            interceptors=[BlockTokenInterceptor(self.settings.block_token_secret)]
+        )
         pb2_grpc.add_BlockServiceServicer_to_server(
             BlockServiceImpl(self), self.grpc_server
         )  # registra el servicio en el servidor

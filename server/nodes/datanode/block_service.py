@@ -10,17 +10,128 @@ import grpc
 
 from proto import block_service_pb2 as pb2
 from proto import block_service_pb2_grpc as pb2_grpc
-from server.common.config import MiB, settings
+from server.common.config import MiB
 from server.common.errors import GRPC_ERROR_METADATA_KEY, DfshaError, ErrorCode
 from server.common.tokens import BlockOp, verify
 
-BLOCK_CHUNK_SIZE = settings.block_chunk_size
 MAX_BLOCK_CHUNK_SIZE = 2 * MiB
 PIPELINE_CONNECT_TIMEOUT_S = 1.0
 
 
+class BlockTokenInterceptor(grpc.aio.ServerInterceptor):
+    """Validate block tokens before dispatching a block RPC to its servicer."""
+
+    def __init__(self, secret: str):
+        self.secret = secret
+
+    @staticmethod
+    def _block_operation(method: str) -> BlockOp | None:
+        if method.endswith("/WriteBlock"):
+            return BlockOp.WRITE
+        if method.endswith(("/ReadBlock", "/StatBlock")):
+            return BlockOp.READ
+        return None
+
+    def _validate(
+        self, metadata, block_id: str, operation: BlockOp
+    ) -> None:
+        token = next(
+            (
+                item.value
+                for item in metadata or ()
+                if item.key == "x-block-token" and isinstance(item.value, str)
+            ),
+            None,
+        )
+        if not self.secret:
+            raise DfshaError(
+                ErrorCode.UNAUTHORIZED, "block token secret is not configured"
+            )
+        if token is None:
+            raise DfshaError(ErrorCode.UNAUTHORIZED, "missing block token")
+        verify(token, self.secret, block_id=block_id, op=operation)
+
+    async def _abort(
+        self, context: grpc.aio.ServicerContext, error: DfshaError
+    ) -> None:
+        await context.abort(
+            grpc.StatusCode[error.grpc_status],
+            error.message,
+            trailing_metadata=((GRPC_ERROR_METADATA_KEY, error.code.value),),
+        )
+
+    async def intercept_service(self, continuation, handler_call_details):
+        handler = await continuation(handler_call_details)
+        if handler is None:
+            return None
+
+        operation = self._block_operation(handler_call_details.method)
+        if operation is None:
+            return handler
+
+        if handler_call_details.method.endswith("/WriteBlock"):
+            async def stream_unary(request_iterator, context):
+                first = await anext(request_iterator, None)
+                if first is None or not first.HasField("header"):
+                    await self._abort(
+                        context,
+                        DfshaError(ErrorCode.BAD_REQUEST, "Missing WriteBlockHeader"),
+                    )
+                try:
+                    self._validate(
+                        context.invocation_metadata(),
+                        first.header.block_id,
+                        operation,
+                    )
+                except DfshaError as error:
+                    await self._abort(context, error)
+
+                async def replay_stream():
+                    yield first
+                    async for request in request_iterator:
+                        yield request
+
+                return await handler.stream_unary(replay_stream(), context)
+
+            return grpc.stream_unary_rpc_method_handler(
+                stream_unary,
+                request_deserializer=handler.request_deserializer,
+                response_serializer=handler.response_serializer,
+            )
+
+        async def authorize_request(request, context):
+            try:
+                self._validate(
+                    context.invocation_metadata(), request.block_id, operation
+                )
+            except DfshaError as error:
+                await self._abort(context, error)
+
+        if handler.response_streaming:
+            async def unary_stream(request, context):
+                await authorize_request(request, context)
+                async for response in handler.unary_stream(request, context):
+                    yield response
+
+            return grpc.unary_stream_rpc_method_handler(
+                unary_stream,
+                request_deserializer=handler.request_deserializer,
+                response_serializer=handler.response_serializer,
+            )
+
+        async def unary_unary(request, context):
+            await authorize_request(request, context)
+            return await handler.unary_unary(request, context)
+
+        return grpc.unary_unary_rpc_method_handler(
+            unary_unary,
+            request_deserializer=handler.request_deserializer,
+            response_serializer=handler.response_serializer,
+        )
+
+
 class BlockServiceImpl(pb2_grpc.BlockServiceServicer):
-    """Authenticated streaming block operations for a single DataNode."""
+    """Streaming block operations for a single DataNode."""
 
     def __init__(self, datanode):
         self.dn = datanode
@@ -53,37 +164,6 @@ class BlockServiceImpl(pb2_grpc.BlockServiceServicer):
             trailing_metadata=((GRPC_ERROR_METADATA_KEY, "DATA_LOSS"),),
         )
 
-    async def _authorize(
-        self,
-        context: grpc.aio.ServicerContext,
-        block_id: str,
-        op: BlockOp,
-    ) -> str:
-        token = next(
-            (
-                item.value
-                for item in context.invocation_metadata()
-                if item.key == "x-block-token" and isinstance(item.value, str)
-            ),
-            None,
-        )
-        try:
-            if not self.dn.settings.block_token_secret:
-                raise DfshaError(
-                    ErrorCode.UNAUTHORIZED, "block token secret is not configured"
-                )
-            if token is None:
-                raise DfshaError(ErrorCode.UNAUTHORIZED, "missing block token")
-            verify(
-                token,
-                self.dn.settings.block_token_secret,
-                block_id=block_id,
-                op=op,
-            )
-        except DfshaError as error:
-            await self._abort(context, error.code, error.message)
-        return token
-
     async def Health(
         self, request: pb2.HealthRequest, context: grpc.aio.ServicerContext
     ) -> pb2.HealthResponse:
@@ -105,7 +185,11 @@ class BlockServiceImpl(pb2_grpc.BlockServiceServicer):
         if header_request is None or not header_request.HasField("header"):
             await self._abort(context, ErrorCode.BAD_REQUEST, "Missing WriteBlockHeader")
         header = header_request.header
-        token = await self._authorize(context, header.block_id, BlockOp.WRITE)
+        token = next(
+            item.value
+            for item in context.invocation_metadata()
+            if item.key == "x-block-token" and isinstance(item.value, str)
+        )
         if header.size < 0:
             await self._abort(context, ErrorCode.BAD_REQUEST, "Block size cannot be negative")
 
@@ -392,7 +476,6 @@ class BlockServiceImpl(pb2_grpc.BlockServiceServicer):
         self, request: pb2.ReadBlockRequest, context: grpc.aio.ServicerContext
     ) -> AsyncIterator[pb2.ReadBlockResponse]:
         """Stream only the requested range while reporting whole-block metadata."""
-        await self._authorize(context, request.block_id, BlockOp.READ)
         try:
             total_size, checksum = self.storage.get_block_info(request.block_id)
         except FileNotFoundError:
@@ -456,7 +539,6 @@ class BlockServiceImpl(pb2_grpc.BlockServiceServicer):
         self, request: pb2.StatBlockRequest, context: grpc.aio.ServicerContext
     ) -> pb2.StatBlockResponse:
         """Return authenticated block metadata without transferring block bytes."""
-        await self._authorize(context, request.block_id, BlockOp.READ)
         try:
             size, checksum = self.storage.get_block_info(request.block_id)
         except FileNotFoundError:

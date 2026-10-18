@@ -339,6 +339,41 @@ async def test_stat_block_rejects_an_expired_token(cluster):
     assert dict(error.value.trailing_metadata())["x-dfsha-error-code"] == "UNAUTHORIZED"
 
 
+@pytest.mark.parametrize(
+    ("token", "status", "error_code"),
+    [
+        (None, grpc.StatusCode.UNAUTHENTICATED, "UNAUTHORIZED"),
+        (_token("different", BlockOp.WRITE), grpc.StatusCode.PERMISSION_DENIED, "FORBIDDEN"),
+        (_token("blk_write_auth", BlockOp.READ), grpc.StatusCode.PERMISSION_DENIED, "FORBIDDEN"),
+    ],
+)
+async def test_write_block_interceptor_rejects_unauthorized_calls(
+    cluster, token, status, error_code
+):
+    dn1, _, _ = cluster
+
+    async def requests():
+        yield pb2.WriteBlockRequest(
+            header=pb2.WriteBlockHeader(
+                block_id="blk_write_auth",
+                size=len(BLOCK),
+                checksum_sha256=hashlib.sha256(BLOCK).hexdigest(),
+            )
+        )
+        yield pb2.WriteBlockRequest(chunk=BLOCK)
+
+    metadata = () if token is None else (("x-block-token", token),)
+    with pytest.raises(grpc.aio.AioRpcError) as error:
+        async with grpc.aio.insecure_channel(dn1.address) as channel:
+            await pb2_grpc.BlockServiceStub(channel).WriteBlock(
+                requests(), metadata=metadata
+            )
+
+    assert error.value.code() == status
+    assert dict(error.value.trailing_metadata())["x-dfsha-error-code"] == error_code
+    assert not os.path.exists(dn1.storage.get_temp_block_path("blk_write_auth"))
+
+
 async def test_duplicate_write_is_idempotent_and_immutable(cluster):
     dn1, _, _ = cluster
     first = await _write_block(dn1.address, "blk_idempotent", BLOCK, [])

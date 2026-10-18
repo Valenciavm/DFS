@@ -722,17 +722,26 @@ This round came from checking the project statement line by line and from runnin
 
 ### Open (need a team decision)
 
+Only two are left, and both have a recommendation attached so they can be answered with a yes.
+
 | # | Topic | Options / notes |
 |---|---|---|
-| A | **Namespace per user.** `API.md` says each user sees their own root `/`, but also that paths can be shared by ACL; today nothing says how a user addresses a file owned by someone else | One global tree with `/users/<name>` hidden by the client, or explicit shared paths. Changes the model, so decide before the schema is final |
-| B | `file_id` format | UUID (as in `API.md`) or opaque id (as in the code: `file_` + 12 hex). If opaque, `API.md` Section 1 is relaxed |
-| C | Default `BLOCK_SIZE` | Contract: 64 MB (demo 1 MB); code: 4 MB. Pick one default and read it from an environment variable |
+| A | **Namespace layout** — `API.md` says each user sees their own root `/`, but also that paths can be shared by ACL, and nothing said how a user addresses a file owned by someone else | **Recommendation: one global tree with `/users/<username>` as each user's home**, presented as `/` by the client. Genuinely separate trees make a shared path impossible to *address*: an ACL granting bruno access to ana's directory needs a name bruno can type. One tree also keeps `mv` possible across a share and lets an `admin` see everything, while "each user sees their own root" stays a client-side presentation detail. **Confirm before the schema is written** (build step 4) |
 | D | **FUSE mount for full access transparency** | The statement describes block-based DFS as integrating with the OS file manager, which would mean `cat` and `vim` working on DFSha paths. It also allows relaxing to "dynamic mechanisms", which is what the CLI and library already give, so this is a differentiator rather than a gap. On WORM storage a faithful mount can only offer **reads plus sequential write on close**; anything that seeks and writes must return `EROFS`. Needs libfuse on Linux (WinFsp on Windows), and it is a thin adapter once the client library and ranged reads exist — so it is the last optional step, not a dependency of anything |
-| E | `UPLOAD_TTL` | Contract: 3600 s; code: 300 s |
-| F | Heartbeat from an unknown node | Respond with an error that makes the DataNode register again; the error code must be added to `API.md` |
-| G | Self-signed CA vs public certificates for the demo | Self-signed is now the default assumption, since the cluster CA is needed anyway for mutual TLS (decision 9). Open only for the **client-facing** endpoints: self-signed (fast) / Let's Encrypt (needs domains) |
-| H | Client-side encryption (`--encrypt`) | Stretch goal |
-| I | Exact `.proto` of the block service | Settled: `proto/block_service.proto` is in the repository and documented in `GRPC_BLOCK_SERVICE.md`. Remaining gaps against `API.md` Section 6 are tracked there |
+| B | Self-signed CA vs public certificates for the demo | Self-signed is now the default assumption, since the cluster CA is needed anyway for mutual TLS (decision 9). Open only for the **client-facing** endpoints: self-signed (fast) / Let's Encrypt (needs domains) |
+| C | Client-side encryption (`--encrypt`) | Stretch goal |
+
+### Closed in v0.7 (defaults that were blocking code)
+
+These were conflicts between the contract and the first draft of the code. They are configuration values, so they are settled here rather than left to block the build.
+
+| # | Decision | Choice | Why |
+|---|---|---|---|
+| 15 | `file_id` format | **UUID4 in canonical form**, as `API.md` Section 1 already said. The code's `file_` + 12 hex is dropped | The contract wins by team rule. UUIDs need no central coordination, PostgreSQL has a native `uuid` type with index support, and 12 hex characters is a birthday-collision risk once there are millions of files. `block_id` stays opaque (`blk_<short>_<index>`), which no component may parse |
+| 16 | Default `BLOCK_SIZE` | **64 MiB**, with the demo profile at **1 MiB**, read from the environment. The code's 4 MB is dropped | 64 MB matches HDFS and the course material, and the contract already said it. The demo profile is what makes a small file produce many blocks so partitioning is visible on screen |
+| 17 | Size units | **Binary throughout** (MiB, GiB), because `BLOCK_CHUNK_SIZE` was already specified in MiB while `BLOCK_SIZE` said MB | Mixing the two invites off-by-4% bugs in placement arithmetic and in the reserved-bytes accounting |
+| 18 | `UPLOAD_TTL_S` | **3600 s**, as the contract said. The code's 300 s is dropped | The TTL only bounds how long an abandoned reservation squats a path, and the garbage collector makes that safe. 300 s would abort honest uploads of a few GB on a slow link. With batched allocation (decision 12) it is refreshed per batch anyway |
+| 19 | Heartbeat or block report from an unknown node | **`409 NODE_NOT_REGISTERED`**, which the DataNode treats as "register again, then resend a full block report" | The case happens on every leader failover and on a NameNode restart, so it is a normal path, not an error path. Silently accepting it would let a node that the leader knows nothing about believe it is participating |
 
 ---
 

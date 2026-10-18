@@ -166,6 +166,7 @@ async def test_a_wrong_checksum_is_rejected_and_leaves_no_file(cluster):
 
     assert error.value.code() == grpc.StatusCode.INVALID_ARGUMENT
     assert dict(error.value.trailing_metadata())["x-dfsha-error-code"] == "CHECKSUM_MISMATCH"
+    assert not os.path.exists(dn1.storage.get_temp_block_path("blk_corrupt"))
     with pytest.raises(FileNotFoundError):
         dn1.storage.read_block("blk_corrupt")
 

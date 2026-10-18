@@ -227,7 +227,19 @@ class BlockServiceImpl(pb2_grpc.BlockServiceServicer):
 
                 if forward_task is not None and forward_queue is not None:
                     if not forward_task.done():
-                        await forward_queue.put(None)
+                        end_task = asyncio.create_task(forward_queue.put(None))
+                        done, _ = await asyncio.wait(
+                            (end_task, forward_task),
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        if forward_task in done:
+                            end_task.cancel()
+                            try:
+                                await end_task
+                            except asyncio.CancelledError:
+                                pass
+                        else:
+                            await end_task
                     forwarded = await forward_task
                 else:
                     forwarded = forward_task is not None

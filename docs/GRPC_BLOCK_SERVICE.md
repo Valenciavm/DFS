@@ -112,7 +112,7 @@ Section references are to [`API.md`](API.md) unless stated otherwise.
 | Gap | Why it matters | Reference |
 |---|---|---|
 | TLS on the block channel (channels are insecure today) | Encryption in transit | Section 2.3 |
-| `x-block-token` validation in a server interceptor | Any client can currently read or write any block | Section 2.1 |
+| Move the implemented per-RPC `x-block-token` checks into a shared gRPC server interceptor | Centralize enforcement and avoid repeating the dispatch logic | Section 2.1 |
 | AES-256-GCM encryption at rest | Encryption in storage | Section 2.3 |
 | Mutual TLS between DataNodes | Node-to-node identity | Section 2 |
 | REST calls to the NameNode: `register`, `heartbeat`, `block-report`, `block-received`, `block-corrupt` | Without these the NameNode cannot count replicas, detect dead nodes or order repairs | Section 7 |

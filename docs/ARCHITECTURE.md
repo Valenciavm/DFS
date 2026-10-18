@@ -1,6 +1,6 @@
 # DFSha — Architecture and Design Decisions (v0.6)
 
-Companion of [`API.md`](API.md) (the contract, v0.7). This document explains **why** the system is built this way, how it meets each requirement, how it will be tested and demonstrated, and which rubric criteria each part supports.
+Companion of [`API.md`](API.md) (the contract, v0.8). This document explains **why** the system is built this way, how it meets each requirement, how it will be tested and demonstrated, and which rubric criteria each part supports.
 
 Since v0.3 it also **unifies the NameNode design with the code already written**: Section 4 (NameNode internals), Section 5 (metadata model and state), Section 6 (algorithms) and Appendix A (what the current code already matches and what must change). The code-level reference for the data model is [`NAMENODE_MODELS.md`](NAMENODE_MODELS.md); the data plane implementation notes are in [`GRPC_BLOCK_SERVICE.md`](GRPC_BLOCK_SERVICE.md).
 
@@ -659,7 +659,7 @@ Tips: rehearse once, keep a pre-recorded backup of the slowest steps, use the de
 |---|---|
 | "Files distributed across several nodes, and each file distributed across several nodes" — two separate properties | Section 6.2 and its node-count floor; evidence in T2 |
 | "Concurrency in access to files **and to data within a file**" | Parallel block transfers (client), ranged reads (Section 6 of `API.md`), locks; evidence in T24 |
-| "Transparency … never static" | Dynamic location transparency: the client never names a node and resolves everything at runtime (`API.md` Section 10). Section 16, decision D records why a FUSE mount is optional rather than required |
+| "Transparency … never static" | Dynamic location transparency: the client never names a node and resolves everything at runtime (`API.md` Section 10). Section 16, open question A records why a FUSE mount is optional rather than required |
 | "Each node must expose an API" | NameNode: REST + OpenAPI at `/docs`. DataNode: gRPC `BlockService` with server reflection in development |
 | "The service runs inside a real or virtual private network" (Option 1) | Section 10 topology and the security groups in Section 9 |
 | "The project must run over the Internet" on AWS Academy / GCP IaaS | Section 10 cloud topology; deployment is a deliverable in its own right |
@@ -686,7 +686,7 @@ Tips: rehearse once, keep a pre-recorded backup of the slowest steps, use the de
 - 2FA protects interactive login only; it is not re-checked per request, and API keys are exempt by design (Section 9.1).
 - The cluster needs **more DataNodes than the replication factor** to partition and to repair at all (Section 6.2). With exactly three nodes and factor 3 the system still works, but it mirrors instead of partitioning and cannot re-replicate.
 - Client-side encryption is a stretch goal.
-- Full POSIX access transparency (a FUSE mount) is not provided: the client exposes dynamic location transparency through a CLI and a library, which the statement allows, but existing programs cannot open DFSha paths directly. A read-only mount is the natural extension (Section 16, decision D).
+- Full POSIX access transparency (a FUSE mount) is not provided: the client exposes dynamic location transparency through a CLI and a library, which the statement allows, but existing programs cannot open DFSha paths directly. A read-only mount is the natural extension (Section 16, open question A).
 - The block channel uses gRPC: it cannot be called from a browser or with plain `curl`, and debugging it needs `grpcurl` (with server reflection enabled in development).
 - gRPC needs HTTP/2 end to end: any load balancer or proxy placed in front of the DataNodes must support it.
 
@@ -722,16 +722,15 @@ This round came from checking the project statement line by line and from runnin
 
 ### Open (need a team decision)
 
-Only two are left, and both have a recommendation attached so they can be answered with a yes.
+One is left, with a recommendation attached so it can be answered with a yes.
 
 | # | Topic | Options / notes |
 |---|---|---|
-| A | **Namespace layout** — `API.md` says each user sees their own root `/`, but also that paths can be shared by ACL, and nothing said how a user addresses a file owned by someone else | **Recommendation: one global tree with `/users/<username>` as each user's home**, presented as `/` by the client. Genuinely separate trees make a shared path impossible to *address*: an ACL granting bruno access to ana's directory needs a name bruno can type. One tree also keeps `mv` possible across a share and lets an `admin` see everything, while "each user sees their own root" stays a client-side presentation detail. **Confirm before the schema is written** (build step 4) |
-| D | **FUSE mount for full access transparency** | The statement describes block-based DFS as integrating with the OS file manager, which would mean `cat` and `vim` working on DFSha paths. It also allows relaxing to "dynamic mechanisms", which is what the CLI and library already give, so this is a differentiator rather than a gap. On WORM storage a faithful mount can only offer **reads plus sequential write on close**; anything that seeks and writes must return `EROFS`. Needs libfuse on Linux (WinFsp on Windows), and it is a thin adapter once the client library and ranged reads exist — so it is the last optional step, not a dependency of anything |
+| A | **FUSE mount for full access transparency** | The statement describes block-based DFS as integrating with the OS file manager, which would mean `cat` and `vim` working on DFSha paths. It also allows relaxing to "dynamic mechanisms", which is what the CLI and library already give, so this is a differentiator rather than a gap. On WORM storage a faithful mount can only offer **reads plus sequential write on close**; anything that seeks and writes must return `EROFS`. Needs libfuse on Linux (WinFsp on Windows), and it is a thin adapter once the client library and ranged reads exist — so it is the last optional step, not a dependency of anything |
 | B | Self-signed CA vs public certificates for the demo | Self-signed is now the default assumption, since the cluster CA is needed anyway for mutual TLS (decision 9). Open only for the **client-facing** endpoints: self-signed (fast) / Let's Encrypt (needs domains) |
 | C | Client-side encryption (`--encrypt`) | Stretch goal |
 
-### Closed in v0.7 (defaults that were blocking code)
+### Closed in v0.7 (defaults and layout that were blocking code)
 
 These were conflicts between the contract and the first draft of the code. They are configuration values, so they are settled here rather than left to block the build.
 
@@ -742,6 +741,7 @@ These were conflicts between the contract and the first draft of the code. They 
 | 17 | Size units | **Binary throughout** (MiB, GiB), because `BLOCK_CHUNK_SIZE` was already specified in MiB while `BLOCK_SIZE` said MB | Mixing the two invites off-by-4% bugs in placement arithmetic and in the reserved-bytes accounting |
 | 18 | `UPLOAD_TTL_S` | **3600 s**, as the contract said. The code's 300 s is dropped | The TTL only bounds how long an abandoned reservation squats a path, and the garbage collector makes that safe. 300 s would abort honest uploads of a few GB on a slow link. With batched allocation (decision 12) it is refreshed per batch anyway |
 | 19 | Heartbeat or block report from an unknown node | **`409 NODE_NOT_REGISTERED`**, which the DataNode treats as "register again, then resend a full block report" | The case happens on every leader failover and on a NameNode restart, so it is a normal path, not an error path. Silently accepting it would let a node that the leader knows nothing about believe it is participating |
+| 20 | Namespace layout | **One global tree; each user's home is `/users/<username>`.** The client library maps the home to `/` for display and prefixes relative paths on the way out; the server never rewrites paths | `API.md` promised each user their own root and also sharing by ACL, and those conflict: with genuinely separate trees a shared path cannot be *addressed*, since an ACL granting bruno access to ana's directory needs a name bruno can type. One tree also keeps `mv` possible across a share, lets an `admin` see everything, and keeps the server free of per-request path rewriting. "Each user sees their own root" survives as a client-side presentation detail |
 
 ---
 

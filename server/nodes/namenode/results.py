@@ -83,3 +83,20 @@ class GcResult:
 
     expired: int  # PENDING uploads that ran past their expiry and were aborted
     purged: int   # ABORTED records forgotten after their retention
+
+
+@dataclass(frozen=True)
+class ClusterStats:
+    """Totals for ``GET /v1/admin/stats`` (``API.md`` Section 8).
+
+    ``under_replicated_blocks`` is the number the failure demos watch: it rises
+    when a DataNode dies and must return to 0 once repair finishes.
+    """
+
+    files: int
+    blocks: int
+    under_replicated_blocks: int
+    live_nodes: int
+    dead_nodes: int
+    bytes_stored: int  # logical size of committed files, not counting replicas
+    term: int

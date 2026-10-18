@@ -14,10 +14,12 @@ from each other.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import random
 import re
 import uuid
+from collections.abc import Callable
 
 from server.common.clock import Clock, SystemClock
 from server.common.config import ConfigError, Settings
@@ -35,6 +37,7 @@ from server.nodes.namenode.models import (
 )
 from server.nodes.namenode.results import (
     BlockLocation,
+    ClusterStats,
     CommittedBlock,
     FileLocation,
     GcResult,
@@ -56,6 +59,11 @@ _SHA256 = re.compile(r"[0-9a-f]{64}")
 #: A copy that has not been confirmed after this long is given up on, so one lost
 #: command cannot block the repair of a block forever. Monotonic seconds.
 IN_FLIGHT_TIMEOUT_S = 120
+
+#: Periods of the background tasks (``ARCHITECTURE.md`` Section 4.2), in seconds.
+LIVENESS_PERIOD_S = 5
+REPLICATION_PERIOD_S = 10
+GC_PERIOD_S = 30
 
 
 class Namenode:
@@ -736,3 +744,66 @@ class Namenode:
             self._abort(file, now)
         purged = self.store.purge_aborted(older_than=now - self.settings.upload_ttl_s)
         return GcResult(expired=len(expired), purged=len(purged))
+
+    # ---- observability -----------------------------------------------------
+
+    def stats(self) -> ClusterStats:
+        """Cluster totals, including the under-replicated count the demos watch."""
+        committed = self.store.files(FileStatus.COMMITTED)
+        under = sum(
+            1
+            for file in committed
+            for block in file.blocks
+            if len(self._live_holders(block.block_id)) < file.replication
+        )
+        nodes = list(self.cluster.datanodes.values())
+        return ClusterStats(
+            files=len(committed),
+            blocks=sum(len(f.blocks) for f in committed),
+            under_replicated_blocks=under,
+            live_nodes=sum(1 for n in nodes if n.is_alive),
+            dead_nodes=sum(1 for n in nodes if not n.is_alive),
+            bytes_stored=sum(f.size_bytes for f in committed),
+            term=self.term,
+        )
+
+    # ---- background tasks --------------------------------------------------
+
+    async def run(self) -> None:
+        """Runs the REST server and the background tasks until cancelled."""
+        await asyncio.gather(
+            self.api_server(),
+            self.monitor_datanodes(),
+            self.monitor_replication(),
+            self.garbage_collector(),
+        )
+
+    async def api_server(self) -> None:
+        """Serves the REST API. The NameNode speaks REST only, never gRPC.
+
+        The FastAPI layer is the next build step (``ARCHITECTURE.md`` Section 5.2),
+        so for now this just keeps the process alive next to the other tasks.
+        """
+        await asyncio.Event().wait()
+
+    async def monitor_datanodes(self) -> None:
+        await self._every(LIVENESS_PERIOD_S, self.check_liveness)
+
+    async def monitor_replication(self) -> None:
+        await self._every(REPLICATION_PERIOD_S, self.scan_replication)
+
+    async def garbage_collector(self) -> None:
+        await self._every(GC_PERIOD_S, self.collect_garbage)
+
+    async def _every(self, period_s: float, task: Callable[[], object]) -> None:
+        """Calls ``task`` forever, ``period_s`` apart.
+
+        A failure is logged and the loop carries on. These tasks are what notice a
+        dead DataNode and repair its blocks, so one bad iteration must never stop them.
+        """
+        while True:
+            try:
+                task()
+            except Exception:  # a background task must outlive any single failure
+                logger.exception("background task %s failed; will retry", getattr(task, "__name__", task))
+            await asyncio.sleep(period_s)

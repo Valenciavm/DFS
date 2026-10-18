@@ -16,15 +16,29 @@ from __future__ import annotations
 
 import logging
 import random
+import re
+import uuid
 
 from server.common.clock import Clock, SystemClock
 from server.common.config import ConfigError, Settings
 from server.common.config import settings as default_settings
 from server.common.errors import DfshaError, ErrorCode
+from server.common.paths import join_path, split_path
+from server.common.tokens import BlockOp, mint
+from server.nodes.namenode import placement
 from server.nodes.namenode.cluster_state import ClusterState, Command, DataNodeInfo
+from server.nodes.namenode.models import (
+    BlockMetadata,
+    DirectoryMetadata,
+    FileMetadata,
+    FileStatus,
+)
+from server.nodes.namenode.results import CommittedBlock, PlannedBlock, UploadPlan
 from server.nodes.namenode.store import InMemoryMetadataStore, MetadataStore
 
 logger = logging.getLogger(__name__)
+
+_SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
 class Namenode:
@@ -158,3 +172,318 @@ class Namenode:
 
     def _take_commands(self, node_id: str) -> list[Command]:
         return self.cluster.pending_commands.pop(node_id, [])
+
+    # ---- uploads ---------------------------------------------------------
+
+    def prepare_file_upload(
+        self, path: str, size_bytes: int, owner: str, overwrite: bool = False
+    ) -> UploadPlan:
+        """Step 1 of ``put`` (``ARCHITECTURE.md`` Section 4.3).
+
+        Validates, reserves the path as a `PENDING` file, splits it into blocks
+        and chooses a pipeline for **each** block. The pipeline is a plan: nothing
+        counts as a replica until a DataNode confirms it.
+        """
+        s = self.settings
+        segments = split_path(path)
+        if not segments:
+            raise DfshaError(ErrorCode.IS_A_DIRECTORY, "/ is a directory")
+        path = join_path(segments)
+        if isinstance(size_bytes, bool) or not isinstance(size_bytes, int) or size_bytes < 0:
+            raise DfshaError(ErrorCode.BAD_REQUEST, "size must be a non-negative integer")
+        if size_bytes > s.max_file_size_bytes:
+            raise DfshaError(
+                ErrorCode.FILE_TOO_LARGE,
+                f"{size_bytes} bytes exceeds the limit of {s.max_file_size_bytes}",
+            )
+        if not owner:
+            raise DfshaError(ErrorCode.BAD_REQUEST, "an upload needs an owner")
+        self.store.resolve_dir(join_path(segments[:-1]))  # DIR_NOT_FOUND / NOT_A_DIRECTORY
+
+        now = self.clock.time()
+        pending = self.store.get_pending(path)
+        if pending is not None:
+            if pending.expires_at is not None and pending.expires_at > now:
+                raise DfshaError(ErrorCode.UPLOAD_IN_PROGRESS, f"{path} has an upload in progress")
+            self._abort(pending, now)  # the previous upload expired: reclaim the path now
+
+        existing = self.store.stat(path)
+        if isinstance(existing, DirectoryMetadata):
+            raise DfshaError(ErrorCode.IS_A_DIRECTORY, f"{path} is a directory")
+        if existing is not None and not overwrite:
+            raise DfshaError(ErrorCode.ALREADY_EXISTS, f"{path} already exists")
+
+        live = self._live_nodes()
+        if len(live) < s.replication_factor:
+            raise DfshaError(
+                ErrorCode.NOT_ENOUGH_DATANODES,
+                f"need {s.replication_factor} live DataNodes, have {len(live)}",
+            )
+
+        file_id, blocks = self._new_blocks(size_bytes)
+        pipelines = self._place(blocks, live)  # raises before anything is reserved
+        file = FileMetadata(
+            file_id=file_id,
+            name=segments[-1],
+            owner=owner,
+            size_bytes=size_bytes,
+            block_size=s.block_size,
+            replication=s.replication_factor,
+            status=FileStatus.PENDING,
+            created_at=now,
+            modified_at=now,
+            expires_at=now + s.upload_ttl_s,
+            blocks=blocks,
+        )
+        self.store.create_pending_file(path, file)
+
+        planned: list[PlannedBlock] = []
+        for block, chosen in zip(blocks, pipelines, strict=True):
+            self.cluster.pipelines[block.block_id] = [n.node_id for n in chosen]
+            for node in chosen:
+                self._reserve(block.block_id, node.node_id, block.size_bytes)
+            token = mint(
+                block.block_id, BlockOp.WRITE, owner, s.block_token_secret, s.token_ttl_s, now=now
+            )
+            planned.append(PlannedBlock(block=block, pipeline=chosen, token=token))
+        return UploadPlan(file=file, path=path, blocks=planned)
+
+    def commit_file_upload(
+        self,
+        file_id: str,
+        blocks: list[CommittedBlock],
+        file_checksum: str | None = None,
+    ) -> FileMetadata:
+        """Step 3 of ``put`` (``ARCHITECTURE.md`` Section 4.3, ``API.md`` Section 5.2).
+
+        Accepted only if every block is listed with the right size and every block
+        has at least ``MIN_REPLICAS_COMMIT`` replicas **confirmed by DataNodes** on
+        live nodes whose checksum equals the client's. That is the write quorum, and
+        it is checked against confirmations, never against the planned pipeline.
+        """
+        s = self.settings
+        file = self.store.get_file_by_id(file_id)
+        if file is None:
+            raise DfshaError(ErrorCode.FILE_NOT_FOUND, f"no upload with id {file_id}")
+        now = self.clock.time()
+
+        if file.status is FileStatus.COMMITTED:
+            if self._same_body(file, blocks, file_checksum):
+                return file  # a retried commit is a success, not an error
+            raise DfshaError(ErrorCode.ALREADY_EXISTS, "file already committed with other contents")
+        if file.status is FileStatus.ABORTED:
+            raise DfshaError(ErrorCode.FILE_NOT_FOUND, "the upload was aborted or expired")
+        if file.expires_at is not None and file.expires_at <= now:
+            self._abort(file, now)
+            raise DfshaError(ErrorCode.FILE_NOT_FOUND, "the upload expired")
+
+        reported = self._validate_report(file, blocks, file_checksum)
+
+        live = {n.node_id for n in self._live_nodes()}
+        corrupt: dict[str, list[str]] = {}
+        for block in file.blocks:
+            claimed = reported[block.index].checksum
+            checksums = self.cluster.replica_checksums.get(block.block_id, {})
+            holders = sorted(self.cluster.replicas.get(block.block_id, set()) & live)
+            good = [nid for nid in holders if checksums.get(nid) == claimed]
+            if len(good) < s.min_replicas_commit:
+                if len(holders) > len(good):
+                    raise DfshaError(
+                        ErrorCode.CHECKSUM_MISMATCH,
+                        f"block {block.index}: a DataNode stored different bytes than the client sent",
+                    )
+                raise DfshaError(
+                    ErrorCode.INSUFFICIENT_REPLICAS,
+                    f"block {block.index} has {len(good)} confirmed replicas, "
+                    f"{s.min_replicas_commit} required",
+                )
+            corrupt[block.block_id] = [nid for nid in holders if nid not in good]
+
+        # the quorum holds: commit as one step
+        for block in file.blocks:
+            block.checksum = reported[block.index].checksum
+        file.checksum = file_checksum
+        replaced = self.store.commit_file(file_id, now)
+
+        for block in file.blocks:
+            self._release_block_reservations(block.block_id)  # unconfirmed hops never arrived
+            self.cluster.pipelines.pop(block.block_id, None)
+            for nid in corrupt[block.block_id]:  # a copy that disagrees is not a replica
+                self.cluster.replicas[block.block_id].discard(nid)
+                self.cluster.replica_checksums.get(block.block_id, {}).pop(nid, None)
+                self._enqueue(nid, Command("delete", block.block_id))
+        if replaced is not None:
+            self._schedule_deletion(replaced.blocks)
+        return file
+
+    def abort_file_upload(self, file_id: str) -> None:
+        """Cancels a pending upload. Idempotent (``API.md`` Section 5.6)."""
+        file = self.store.get_file_by_id(file_id)
+        if file is None or file.status is FileStatus.ABORTED:
+            return
+        if file.status is FileStatus.COMMITTED:
+            raise DfshaError(ErrorCode.BAD_REQUEST, "the file is already committed; remove it instead")
+        self._abort(file, self.clock.time())
+
+    def record_block_received(
+        self, node_id: str, block_id: str, size: int, checksum: str
+    ) -> None:
+        """A DataNode confirms it stored a block (``API.md`` Section 7).
+
+        This is what turns an allocated pipeline slot into a replica. A block
+        nobody asked for, or one that is the wrong size, is told to delete itself.
+        """
+        self._known(node_id)
+        block = self.store.get_block(block_id)
+        file = self.store.file_of_block(block_id)
+        if block is None or file is None or file.status is FileStatus.ABORTED:
+            self._enqueue(node_id, Command("delete", block_id))  # an orphan
+            return
+        if size != block.size_bytes:
+            logger.warning("%s stored %s with %d bytes, expected %d", node_id, block_id, size, block.size_bytes)
+            self._enqueue(node_id, Command("delete", block_id))
+            return
+        self._confirm_replica(node_id, block, checksum)
+
+    # ---- upload internals ------------------------------------------------
+
+    def _new_blocks(self, size_bytes: int) -> tuple[str, list[BlockMetadata]]:
+        """A fresh file id and its blocks. Ids are re-drawn on the (remote) chance of a clash."""
+        count = self.settings.blocks_for(size_bytes)
+        while True:
+            file_id = str(uuid.uuid4())
+            short = file_id.replace("-", "")[:8]
+            ids = [f"blk_{short}_{i:06d}" for i in range(count)]
+            if self.store.get_file_by_id(file_id) is None and all(
+                self.store.get_block(b) is None for b in ids
+            ):
+                break
+        blocks: list[BlockMetadata] = []
+        remaining = size_bytes
+        for index, block_id in enumerate(ids):
+            size = min(self.settings.block_size, remaining)
+            blocks.append(BlockMetadata(block_id=block_id, index=index, size_bytes=size))
+            remaining -= size
+        return file_id, blocks
+
+    def _place(self, blocks: list[BlockMetadata], live: list[DataNodeInfo]) -> list[list[DataNodeInfo]]:
+        """A pipeline per block, accounting for space the earlier blocks will take.
+
+        Works on a scratch copy of the reservations, so if a later block cannot be
+        placed nothing has been reserved and there is nothing to roll back.
+        """
+        scratch = dict(self.cluster.reserved_bytes)
+        result: list[list[DataNodeInfo]] = []
+        for block in blocks:
+            chosen = placement.choose_pipeline(
+                live, scratch, block.size_bytes, self.settings.replication_factor, self.rng
+            )
+            for node in chosen:
+                scratch[node.node_id] = scratch.get(node.node_id, 0) + block.size_bytes
+            result.append(chosen)
+        return result
+
+    def _validate_report(
+        self, file: FileMetadata, blocks: list[CommittedBlock], file_checksum: str | None
+    ) -> dict[int, CommittedBlock]:
+        """Checks the shape of a commit body and returns it indexed by block index."""
+        by_index: dict[int, CommittedBlock] = {}
+        for item in blocks:
+            if item.index in by_index:
+                raise DfshaError(ErrorCode.BAD_REQUEST, f"block {item.index} is listed twice")
+            by_index[item.index] = item
+        if set(by_index) != set(range(len(file.blocks))):
+            raise DfshaError(
+                ErrorCode.BAD_REQUEST, f"all {len(file.blocks)} blocks must be listed exactly once"
+            )
+        total = 0
+        for block in file.blocks:
+            item = by_index[block.index]
+            if item.block_id != block.block_id:
+                raise DfshaError(ErrorCode.BAD_REQUEST, f"block {block.index} has the wrong block_id")
+            if item.size != block.size_bytes:
+                raise DfshaError(
+                    ErrorCode.BAD_REQUEST,
+                    f"block {block.index} is {item.size} bytes, expected {block.size_bytes}",
+                )
+            if not _SHA256.fullmatch(item.checksum):
+                raise DfshaError(ErrorCode.BAD_REQUEST, f"block {block.index} checksum is not SHA-256 hex")
+            total += item.size
+        if total != file.size_bytes:
+            raise DfshaError(ErrorCode.BAD_REQUEST, "block sizes do not add up to the declared size")
+        if file_checksum is not None and not _SHA256.fullmatch(file_checksum):
+            raise DfshaError(ErrorCode.BAD_REQUEST, "file_checksum is not SHA-256 hex")
+        return by_index
+
+    @staticmethod
+    def _same_body(file: FileMetadata, blocks: list[CommittedBlock], file_checksum: str | None) -> bool:
+        """Whether a retried commit describes the file as it was committed."""
+        by_index = {b.index: b for b in blocks}
+        if len(blocks) != len(file.blocks) or len(by_index) != len(blocks):
+            return False
+        for block in file.blocks:
+            item = by_index.get(block.index)
+            if item is None or item.block_id != block.block_id or item.checksum != block.checksum:
+                return False
+        return file_checksum is None or file_checksum == file.checksum
+
+    def _abort(self, file: FileMetadata, now: float) -> None:
+        """`PENDING` to `ABORTED`, freeing the path and telling holders to delete."""
+        self.store.abort_file(file.file_id, now)
+        self._schedule_deletion(file.blocks)
+
+    def _confirm_replica(self, node_id: str, block: BlockMetadata, checksum: str) -> None:
+        """Records a confirmed copy and releases the space that was held for it."""
+        self.cluster.replicas.setdefault(block.block_id, set()).add(node_id)
+        self.cluster.replica_checksums.setdefault(block.block_id, {})[node_id] = checksum
+        self._release_reservation(block.block_id, node_id)
+        flight = self.cluster.in_flight_replications.get(block.block_id)
+        if flight is not None:
+            flight.pop(node_id, None)
+            if not flight:
+                del self.cluster.in_flight_replications[block.block_id]
+
+    def _schedule_deletion(self, blocks: list[BlockMetadata]) -> None:
+        """Forgets blocks and tells every node that may hold them to delete them.
+
+        Nodes that are down are asked too; they receive the command when they
+        return. Anything that still slips through is an orphan, which the next
+        block report removes.
+        """
+        for block in blocks:
+            block_id = block.block_id
+            holders = set(self.cluster.replicas.pop(block_id, ()))
+            holders |= set(self.cluster.pipelines.pop(block_id, ()))
+            holders |= set(self.cluster.in_flight_replications.pop(block_id, {}))
+            holders |= set(self.cluster.reservations.get(block_id, {}))
+            self._release_block_reservations(block_id)
+            self.cluster.replica_checksums.pop(block_id, None)
+            for node_id in sorted(holders):
+                if node_id in self.cluster.datanodes:
+                    self._enqueue(node_id, Command("delete", block_id))
+
+    def _reserve(self, block_id: str, node_id: str, nbytes: int) -> None:
+        """Claims ``nbytes`` on a node for a block, once per (block, node)."""
+        held = self.cluster.reservations.setdefault(block_id, {})
+        if node_id in held:
+            return
+        held[node_id] = nbytes
+        self.cluster.reserved_bytes[node_id] = self.cluster.reserved_bytes.get(node_id, 0) + nbytes
+
+    def _release_reservation(self, block_id: str, node_id: str) -> None:
+        """Gives back what ``_reserve`` claimed. Safe to call twice: the second is a no-op."""
+        held = self.cluster.reservations.get(block_id)
+        if held is None or node_id not in held:
+            return
+        nbytes = held.pop(node_id)
+        if not held:
+            del self.cluster.reservations[block_id]
+        remaining = self.cluster.reserved_bytes.get(node_id, 0) - nbytes
+        if remaining > 0:
+            self.cluster.reserved_bytes[node_id] = remaining
+        else:
+            self.cluster.reserved_bytes.pop(node_id, None)
+
+    def _release_block_reservations(self, block_id: str) -> None:
+        for node_id in list(self.cluster.reservations.get(block_id, {})):
+            self._release_reservation(block_id, node_id)

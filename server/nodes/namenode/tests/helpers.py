@@ -5,7 +5,9 @@ import hashlib
 
 from server.common.errors import DfshaError, ErrorCode
 from server.nodes.namenode.core import Namenode
+from server.nodes.namenode.results import CommittedBlock, UploadPlan
 
+MIB = 1 << 20
 GIB = 1 << 30
 
 
@@ -30,3 +32,37 @@ def code_of(call) -> ErrorCode:
     except DfshaError as error:
         return error.code
     raise AssertionError("expected a DfshaError, but the call succeeded")
+
+
+def confirm_all(nn: Namenode, plan: UploadPlan, replicas: int | None = None) -> None:
+    """Plays the DataNodes: each pipeline node (or the first ``replicas``) reports block-received."""
+    for planned in plan.blocks:
+        nodes = planned.pipeline if replicas is None else planned.pipeline[:replicas]
+        for node in nodes:
+            nn.record_block_received(
+                node.node_id,
+                planned.block.block_id,
+                planned.block.size_bytes,
+                checksum_of(planned.block.block_id),
+            )
+
+
+def commit_body(plan: UploadPlan) -> list[CommittedBlock]:
+    """What an honest client would send to commit ``plan``."""
+    return [
+        CommittedBlock(
+            index=p.block.index,
+            block_id=p.block.block_id,
+            size=p.block.size_bytes,
+            checksum=checksum_of(p.block.block_id),
+        )
+        for p in plan.blocks
+    ]
+
+
+def upload(nn: Namenode, path: str, size: int, owner: str = "ana", overwrite: bool = False):
+    """prepare + confirm on every pipeline node + commit. Returns the plan."""
+    plan = nn.prepare_file_upload(path, size, owner, overwrite=overwrite)
+    confirm_all(nn, plan)
+    nn.commit_file_upload(plan.file.file_id, commit_body(plan))
+    return plan

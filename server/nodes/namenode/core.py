@@ -38,6 +38,7 @@ from server.nodes.namenode.results import (
     CommittedBlock,
     FileLocation,
     PlannedBlock,
+    ReportedBlock,
     UploadPlan,
 )
 from server.nodes.namenode.store import (
@@ -49,6 +50,10 @@ from server.nodes.namenode.store import (
 logger = logging.getLogger(__name__)
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
+
+#: A copy that has not been confirmed after this long is given up on, so one lost
+#: command cannot block the repair of a block forever. Monotonic seconds.
+IN_FLIGHT_TIMEOUT_S = 120
 
 
 class Namenode:
@@ -319,8 +324,7 @@ class Namenode:
             self._release_block_reservations(block.block_id)  # unconfirmed hops never arrived
             self.cluster.pipelines.pop(block.block_id, None)
             for nid in corrupt[block.block_id]:  # a copy that disagrees is not a replica
-                self.cluster.replicas[block.block_id].discard(nid)
-                self.cluster.replica_checksums.get(block.block_id, {}).pop(nid, None)
+                self._discard_replica(nid, block.block_id)
                 self._enqueue(nid, Command("delete", block.block_id))
         if replaced is not None:
             self._schedule_deletion(replaced.blocks)
@@ -566,3 +570,59 @@ class Namenode:
             nid for nid in holders
             if (node := self.cluster.datanodes.get(nid)) is not None and node.is_alive
         )
+
+    # ---- block reports -----------------------------------------------------
+
+    def process_block_report(self, node_id: str, blocks: list[ReportedBlock]) -> list[Command]:
+        """Reconciles a DataNode's full inventory with the metadata (``API.md`` Section 7).
+
+        This is how replica locations are rebuilt after a failover, since they are
+        soft state. It also finds orphans (blocks nobody owns, or that belong to an
+        aborted upload) and damaged copies, and notices blocks the node used to hold
+        and no longer reports. Returns the node's pending commands.
+        """
+        self._known(node_id)
+        reported: set[str] = set()
+        for item in blocks:
+            reported.add(item.block_id)
+            block = self.store.get_block(item.block_id)
+            file = self.store.file_of_block(item.block_id)
+            if block is None or file is None or file.status is FileStatus.ABORTED:
+                self._enqueue(node_id, Command("delete", item.block_id))  # an orphan
+                continue
+            damaged = item.size != block.size_bytes or (
+                block.checksum is not None and item.checksum != block.checksum
+            )
+            if damaged:
+                self._discard_replica(node_id, item.block_id)
+                self._enqueue(node_id, Command("delete", item.block_id))
+                continue
+            self._confirm_replica(node_id, block, item.checksum)
+
+        # blocks this node was believed to hold but did not report are gone
+        for block_id, holders in list(self.cluster.replicas.items()):
+            if node_id in holders and block_id not in reported:
+                self._discard_replica(node_id, block_id)
+        return self._take_commands(node_id)
+
+    def record_block_corrupt(self, node_id: str, block_id: str) -> None:
+        """A DataNode found a damaged block and deleted it (``API.md`` Section 7).
+
+        The replica stops counting; the next replication scan notices the deficit
+        and schedules a fresh copy.
+        """
+        self._known(node_id)
+        self._discard_replica(node_id, block_id)
+
+    def _discard_replica(self, node_id: str, block_id: str) -> None:
+        """Stops counting ``node_id`` as a holder of ``block_id``."""
+        holders = self.cluster.replicas.get(block_id)
+        if holders is not None:
+            holders.discard(node_id)
+            if not holders:
+                del self.cluster.replicas[block_id]
+        checksums = self.cluster.replica_checksums.get(block_id)
+        if checksums is not None:
+            checksums.pop(node_id, None)
+            if not checksums:
+                del self.cluster.replica_checksums[block_id]

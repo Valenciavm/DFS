@@ -56,3 +56,30 @@ class FileLocation:
     file: FileMetadata
     path: str
     blocks: list[BlockLocation]
+
+
+@dataclass(frozen=True)
+class ReportedBlock:
+    """One entry of a DataNode's block report (``API.md`` Section 7)."""
+
+    block_id: str
+    size: int
+    checksum: str
+
+
+@dataclass(frozen=True)
+class ReplicationScan:
+    """What one pass of `scan_replication` found and did."""
+
+    under_replicated: int  # committed blocks with fewer live replicas than their target
+    unrecoverable: int     # of those, blocks with no live replica left to copy from
+    scheduled: int         # replicate commands queued in this pass
+    deleted: int           # surplus replicas ordered deleted in this pass
+
+
+@dataclass(frozen=True)
+class GcResult:
+    """What one pass of the garbage collector did."""
+
+    expired: int  # PENDING uploads that ran past their expiry and were aborted
+    purged: int   # ABORTED records forgotten after their retention

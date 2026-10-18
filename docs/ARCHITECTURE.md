@@ -1,8 +1,10 @@
-# DFSha — Architecture and Design Decisions (v0.5)
+# DFSha — Architecture and Design Decisions (v0.6)
 
-Companion of [`API.md`](API.md) (the contract, v0.6). This document explains **why** the system is built this way, how it meets each requirement, how it will be tested and demonstrated, and which rubric criteria each part supports.
+Companion of [`API.md`](API.md) (the contract, v0.7). This document explains **why** the system is built this way, how it meets each requirement, how it will be tested and demonstrated, and which rubric criteria each part supports.
 
-Since v0.3 it also **unifies the NameNode design with the code already written** (`models.py`, `namenode.py`): Section 4 (NameNode internals), Section 5 (metadata model and state), Section 6 (algorithms) and Appendix A (what the current code already matches and what must change). The code-level reference for the data model is [`NAMENODE_MODELS.md`](NAMENODE_MODELS.md).
+Since v0.3 it also **unifies the NameNode design with the code already written**: Section 4 (NameNode internals), Section 5 (metadata model and state), Section 6 (algorithms) and Appendix A (what the current code already matches and what must change). The code-level reference for the data model is [`NAMENODE_MODELS.md`](NAMENODE_MODELS.md); the data plane implementation notes are in [`GRPC_BLOCK_SERVICE.md`](GRPC_BLOCK_SERVICE.md).
+
+**v0.6** re-reads the project statement line by line against the design and folds in what testing the data plane revealed. Eight decisions moved, all recorded with their evidence in Section 16: the metadata store is replicated, the leader degrades to read-only instead of stepping down, node-to-node identity is mutual TLS, TOTP 2FA is required, the cluster needs more DataNodes than the replication factor, blocks are allocated in batches, a write pipeline skips a dead hop, and ranged block reads are a requirement.
 
 ---
 
@@ -630,9 +632,9 @@ Keep raw numbers and a simple chart for the report.
 | 1:30–4:30 | CLI tour: login, `mkdir`, `put`, `ls`, `get`, checksum comparison; show block distribution and replicas (T1, T2) |
 | 4:30–7:00 | DataNode failure: read still works, re-replication restored (T3, T4) |
 | 7:00–8:30 | NameNode failover (T5, T16) |
-| 8:30–10:30 | Security: users/groups/ACL, API key, block tokens, encryption at rest, TLS (T9–T12) |
+| 8:30–10:30 | Security: 2FA enrolment and two-step login (T21), users/groups/ACL, API key as the non-interactive path, block tokens, encryption at rest, TLS and mutual TLS rejecting an unsigned node (T9–T12, T22) |
 | 10:30–12:30 | Concurrency and consistency: T7, T8, T14; integrity T6 |
-| 12:30–14:00 | Scalability: add a DataNode (T13) and the performance chart (T15) |
+| 12:30–14:00 | Scalability: add a DataNode (T13) and the performance chart (T15); show the cluster running on the AWS VMs, not only locally |
 | 14:00–15:00 | Limitations, future work, repository tour |
 
 Tips: rehearse once, keep a pre-recorded backup of the slowest steps, use the demo profile (1 MB blocks) so a small file visibly produces many blocks, and show `/v1/admin/stats` on screen during failures.
@@ -645,11 +647,22 @@ Tips: rehearse once, keep a pre-recorded backup of the slowest steps, use the de
 |---|---|---|
 | **1. Service definition and architectural design (15%)** | Sections 1, 2, 3, 4, 5 and 10 of this file; `API.md` Section 0 | Requirement mapping table, architecture and component diagrams, flows, model and schema |
 | **2. Communications specifications (15%)** | `API.md` (all sections), Section 2 here | Documented interfaces for client↔NN, client↔DN, DN↔DN, NN↔DN, NN↔NN; OpenAPI at `/docs` (REST) and the `.proto` (gRPC block service); error model with HTTP and gRPC status mapping; examples |
-| **3. Scalability design (15%)** | Sections 6, 8 and 11 here; `API.md` Sections 5.1 and 7 (placement, pagination) | T13, T15, charts, honest bottleneck analysis |
-| **4. High availability (15%)** | Section 7 (failure table), Sections 3, 4 and 5.2 here; `API.md` Sections 7 and 9 | T3, T4, T5, T16, T17 live |
-| **5. Replication and data consistency (15%)** | Sections 6 and 7 here; `API.md` Sections 5.2, 5.4 and 6 | T1, T6, T7, T8, T18 |
-| **6. Security (15%)** | Section 9 here; `API.md` Sections 2, 4.1 and 4.2 | T9–T12, audit log, code review of token validation |
-| **7. Video and final report (10%)** | Sections 12 and 13 here | Video plan; report built from this file + test results; reproducible repository (`README`, `docker-compose`, `.env.example`) |
+| **3. Scalability design (15%)** | Sections 6, 8 and 11 here; `API.md` Sections 5.1 and 7 (placement, pagination) | T2, T13, T15, T24, charts. All three dimensions the statement names: **users** (no per-request work proportional to users; tokens validated locally by DataNodes), **number of files** (indexed hard state, paginated `ls`), **file size** (batched allocation, Section 6.3, so nothing grows with the file). Honest bottleneck analysis of the leader |
+| **4. High availability (15%)** | Section 7 (failure table), Sections 3, 4 and 5.2 here; `API.md` Sections 7 and 9 | T3, T4, T5, T16, T17, T20, T23 live. Redundant at **every** layer: 3 block replicas, 2 NameNodes with lease and fencing, replicated metadata store, and degraded read-only mode instead of an outage |
+| **5. Replication and data consistency (15%)** | Sections 6 and 7 here; `API.md` Sections 5.2, 5.4 and 6 | T1, T6, T7, T8, T18, T23. Pipeline replication surviving a dead hop, write quorum on **confirmed** replicas, atomic commit, re-replication back to target |
+| **6. Security (15%)** | Section 9 and 9.1 here; `API.md` Sections 2, 4.1, 4.1.1 and 4.2 | T9–T12, T21, T22, audit log, code review of token validation. Covers the full range the statement names: user/password → ACL per user **and** group → API keys → **TOTP 2FA**, plus encryption in transit (TLS) and at rest (AES-256-GCM), and node-to-node identity by **mutual TLS** |
+| **7. Video and final report (10%)** | Sections 12 and 13 here | Video plan; report built from this file + test results; reproducible repository (`README`, `docker-compose`, `.env.example`) **and a live deployment on AWS Academy**, since the statement requires the project to run over the Internet on IaaS |
+
+**Requirements of the statement that are not rubric rows but feed criterion 1**
+
+| Requirement (statement wording) | Where |
+|---|---|
+| "Files distributed across several nodes, and each file distributed across several nodes" — two separate properties | Section 6.2 and its node-count floor; evidence in T2 |
+| "Concurrency in access to files **and to data within a file**" | Parallel block transfers (client), ranged reads (Section 6 of `API.md`), locks; evidence in T24 |
+| "Transparency … never static" | Dynamic location transparency: the client never names a node and resolves everything at runtime (`API.md` Section 10). Section 16, decision D records why a FUSE mount is optional rather than required |
+| "Each node must expose an API" | NameNode: REST + OpenAPI at `/docs`. DataNode: gRPC `BlockService` with server reflection in development |
+| "The service runs inside a real or virtual private network" (Option 1) | Section 10 topology and the security groups in Section 9 |
+| "The project must run over the Internet" on AWS Academy / GCP IaaS | Section 10 cloud topology; deployment is a deliverable in its own right |
 
 ### Final report outline (from the deliverables list)
 
@@ -669,7 +682,8 @@ Tips: rehearse once, keep a pre-recorded backup of the slowest steps, use the de
 - If **both** database nodes are lost, metadata writes stop: the service degrades to read-only rather than going down (Section 5.2), but it cannot accept changes. The replica and RDS Multi-AZ reduce this to a correlated-failure scenario; they do not eliminate it.
 - The leader NameNode is the only writer of metadata (bottleneck at very large scale).
 - After a failover there is a short window (`FAILOVER_GRACE_S` plus the block reports) in which the leader does not yet know where replicas are, so `commit` may need a retry.
-- WORM only: no in-place partial updates. `write` at file level is expressed as a new version (Section 11, decision 3 of `API.md`).
+- WORM only: no in-place partial updates. `write` at file level is expressed as a new version (decision 3 in Section 11 of `API.md`).
+- 2FA protects interactive login only; it is not re-checked per request, and API keys are exempt by design (Section 9.1).
 - The cluster needs **more DataNodes than the replication factor** to partition and to repair at all (Section 6.2). With exactly three nodes and factor 3 the system still works, but it mirrors instead of partitioning and cannot re-replicate.
 - Client-side encryption is a stretch goal.
 - Full POSIX access transparency (a FUSE mount) is not provided: the client exposes dynamic location transparency through a CLI and a library, which the statement allows, but existing programs cannot open DFSha paths directly. A read-only mount is the natural extension (Section 16, decision D).
@@ -691,6 +705,21 @@ Tips: rehearse once, keep a pre-recorded backup of the slowest steps, use the de
 | 5 | Allocation vs confirmation | Pipeline is a plan; `replicas` holds only confirmed copies | The write quorum can only be checked against confirmations |
 | 6 | Tree representation | `name` + parent reference; path computed | `mv` is O(1) |
 
+### Closed in v0.6, after re-reading the deliverable statement against the design
+
+This round came from checking the project statement line by line and from running the integrated data plane against a real cluster. Each entry says what changed and what evidence drove it.
+
+| # | Decision | Choice | Why |
+|---|---|---|---|
+| 7 | Metadata store redundancy | **Replicated, not a single instance.** Primary + streaming hot standby locally, RDS Multi-AZ in the cloud. Was a stretch goal | Two NameNodes in front of one database only move the single point of failure one layer down, and the statement demands a service "highly redundant to avoid outages or loss of files". Availability is 15% |
+| 8 | Leader behaviour when the database is unreachable | **Keep leadership, degrade to read-only.** Reads from the cache, writes `503`, `degraded: true` | Stepping down would leave nobody serving, because no standby can acquire the lease either; a database outage would become a total outage. Also resolved a contradiction between Sections 5.2 and 7 |
+| 9 | Node-to-node identity | **Mutual TLS** with per-node certificates from a cluster CA, keeping the cluster secret as a second check. Was a stretch goal | The statement asks for security "between data and control nodes"; one shared header value is impersonable by anyone who reads it once. Cost is configuration, since the channels already need TLS |
+| 10 | Two-factor authentication | **TOTP 2FA required** on interactive login, with API keys exempt as the non-interactive path (Section 9.1). Was a stretch goal, then briefly scoped out, then reinstated | The statement names the top of the range explicitly, "up to 2FA, API Keys": listing both means both, and we had only built one |
+| 11 | Cluster size floor | **At least 5 DataNodes**, i.e. more than `REPLICATION_FACTOR`. Was "optionally a fourth node" | Measured on 3 nodes: every block lands on every node, so partitioning is indistinguishable from mirroring, and re-replication is impossible because repair needs a node that does not hold the block. T4 and T13 could not pass |
+| 12 | Block allocation | **Batched during the upload** instead of the whole file at `put` (Section 6.3) | The `put` response, the token lifetimes, the staleness of placement decisions and the reserved capacity all grew with file size. `MAX_FILE_SIZE_BYTES` was the symptom of the design, and file size is a scalability dimension the statement names |
+| 13 | Dead hop in a write pipeline | **Skip it and forward to the next live node** (Section 6.5) | Measured: with the middle node of a 3-node chain down, three replicas became one, below the write quorum, forcing a full re-upload. Section 7 already promised the pipeline would continue |
+| 14 | Ranged block reads | **Required**, not an optimization | The statement asks for concurrency on "data within a file"; random access depends on `offset`/`length`, and serving a few KB by loading a 64 MB block does not scale |
+
 ### Open (need a team decision)
 
 | # | Topic | Options / notes |
@@ -698,12 +727,12 @@ Tips: rehearse once, keep a pre-recorded backup of the slowest steps, use the de
 | A | **Namespace per user.** `API.md` says each user sees their own root `/`, but also that paths can be shared by ACL; today nothing says how a user addresses a file owned by someone else | One global tree with `/users/<name>` hidden by the client, or explicit shared paths. Changes the model, so decide before the schema is final |
 | B | `file_id` format | UUID (as in `API.md`) or opaque id (as in the code: `file_` + 12 hex). If opaque, `API.md` Section 1 is relaxed |
 | C | Default `BLOCK_SIZE` | Contract: 64 MB (demo 1 MB); code: 4 MB. Pick one default and read it from an environment variable |
-| D | `UPLOAD_TTL` | Contract: 3600 s; code: 300 s |
-| E | Heartbeat from an unknown node | Respond with an error that makes the DataNode register again; the error code must be added to `API.md` |
-| F | Self-signed CA vs public certificates for the demo | Self-signed (fast) / Let's Encrypt (needs domains) |
-| G | PostgreSQL replica for HA of the database | Stretch goal / state as a limitation |
+| D | **FUSE mount for full access transparency** | The statement describes block-based DFS as integrating with the OS file manager, which would mean `cat` and `vim` working on DFSha paths. It also allows relaxing to "dynamic mechanisms", which is what the CLI and library already give, so this is a differentiator rather than a gap. On WORM storage a faithful mount can only offer **reads plus sequential write on close**; anything that seeks and writes must return `EROFS`. Needs libfuse on Linux (WinFsp on Windows), and it is a thin adapter once the client library and ranged reads exist — so it is the last optional step, not a dependency of anything |
+| E | `UPLOAD_TTL` | Contract: 3600 s; code: 300 s |
+| F | Heartbeat from an unknown node | Respond with an error that makes the DataNode register again; the error code must be added to `API.md` |
+| G | Self-signed CA vs public certificates for the demo | Self-signed is now the default assumption, since the cluster CA is needed anyway for mutual TLS (decision 9). Open only for the **client-facing** endpoints: self-signed (fast) / Let's Encrypt (needs domains) |
 | H | Client-side encryption (`--encrypt`) | Stretch goal |
-| I | Exact `.proto` of the block service | DataNode owner proposes it by PR; it must follow `API.md` Section 6 |
+| I | Exact `.proto` of the block service | Settled: `proto/block_service.proto` is in the repository and documented in `GRPC_BLOCK_SERVICE.md`. Remaining gaps against `API.md` Section 6 are tracked there |
 
 ---
 

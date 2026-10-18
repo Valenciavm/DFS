@@ -1,4 +1,6 @@
-# DFSha — API Contract (v0.6)
+# DFSha — API Contract (v0.7)
+
+> **Heads-up for the Client owner (v0.7):** `/v1/auth/login` no longer always returns a token. For a user with 2FA enabled it returns `{ "mfa_required": true, "challenge": ... }` and the token comes from `/v1/auth/login/2fa`. Branch on `mfa_required`. See Section 4.1.1.
 
 > **Team rule:** this document is the source of truth for how the components talk to each other.
 > Any change is made through a Pull Request, and the other two teammates are notified before it is merged.
@@ -60,7 +62,7 @@ Clients only ever receive `public_addr` values (called `addr` in the NameNode re
 | `BLOCK_CHUNK_SIZE` | 1 MiB | Size of each streamed chunk on the gRPC block channel (a DataNode rejects chunks above 2 MiB) |
 | `REPLICATION_FACTOR` | 3 | Target replicas per block |
 | `MIN_REPLICAS_COMMIT` | 2 | Write quorum: minimum confirmed replicas per block to allow `commit` |
-| `MAX_FILE_SIZE_BYTES` | 10 GB | `put` allocates all blocks up front, so file size is bounded |
+| `MAX_FILE_SIZE_BYTES` | 10 GB | In this version `put` allocates all blocks up front, so file size is bounded. Batched allocation is already designed (`ARCHITECTURE.md` Section 6.5) and will relax this to an optional quota; it changes Sections 5.1 and 5.5 and lands with its own version bump |
 | `HEARTBEAT_INTERVAL_S` | 5 | DataNode → NameNode |
 | `DEAD_NODE_TIMEOUT_S` | 30 | No heartbeat for this long ⇒ node is considered dead |
 | `BLOCK_REPORT_INTERVAL_S` | 60 | DataNode → NameNode |
@@ -70,6 +72,7 @@ Clients only ever receive `public_addr` values (called `addr` in the NameNode re
 | `LEASE_S` | 15 | NameNode leader lease duration (Section 9) |
 | `FAILOVER_GRACE_S` | 30 | After a failover, the new leader waits this long before declaring any DataNode dead |
 | `LOCK_DEFAULT_TTL_S` | 60 | Default lifetime of a file lock |
+| `MFA_CHALLENGE_TTL_S` | 300 | Lifetime of the single-use login challenge returned when 2FA is enabled (Section 4.1.1) |
 
 ### Versioning policy
 
@@ -85,9 +88,9 @@ There are four mechanisms, one per type of communication:
 
 | From → To | Mechanism | Header / metadata |
 |---|---|---|
-| User → NameNode | JWT (HS256 or RS256), issued by `/v1/auth/login` | `Authorization: Bearer <jwt>` |
-| User/script → NameNode | **API key** (long-lived, revocable, same permissions as its owner) | `Authorization: ApiKey <api_key>` |
-| DataNode → NameNode | Cluster secret, rotated by redeploying nodes | `X-Node-Key: <secret>` (+ `node_id` in the body) |
+| User → NameNode | JWT (HS256 or RS256), issued by `/v1/auth/login`, or by `/v1/auth/login/2fa` when the user has **TOTP 2FA** enabled | `Authorization: Bearer <jwt>` |
+| User/script → NameNode | **API key** (long-lived, revocable, same permissions as its owner, exempt from 2FA by design) | `Authorization: ApiKey <api_key>` |
+| DataNode → NameNode | **Mutual TLS** (per-node certificate from the cluster CA) plus a cluster secret | client certificate + `X-Node-Key: <secret>` (+ `node_id` in the body) |
 | Client / DataNode → DataNode (gRPC) | **Block token** issued by the NameNode | gRPC call metadata `x-block-token: <token>` |
 
 ### 2.1 Block token format
@@ -109,13 +112,14 @@ The shared secret lives only in environment variables of NameNodes and DataNodes
 
 ### 2.2 Other security rules
 
-- Passwords are stored hashed (bcrypt or argon2), never in plain text. Login is the only endpoint that accepts credentials. API keys are stored hashed too and are shown **only once**, when created.
+- Passwords are stored hashed (bcrypt or argon2), never in plain text. Login is the only endpoint that accepts credentials. API keys are stored hashed too and are shown **only once**, when created. TOTP secrets are stored encrypted and recovery codes hashed; both are shown only once, at enrolment (Section 4.1.1).
 - The NameNode checks permissions (owner / ACL for user or group) **before** issuing any token, and re-checks on every FS operation.
 - Each user can only see and modify their own namespace, plus paths shared with them (directly or through a group).
 - A DataNode that cannot present a valid `X-Node-Key` cannot register, send heartbeats or report blocks.
 - The NameNode keeps an **audit log** (timestamp, user, operation, path, result, `X-Request-Id`) of every authentication and FS operation.
 - Roles: `user` (default) and `admin` (needed for Section 8). The first admin is bootstrapped from the `ADMIN_USER` / `ADMIN_PASSWORD` environment variables on first start.
-- Optional hardening (stretch goals): TOTP 2FA at login, per-node keys instead of one cluster secret, mutual TLS between nodes, rate limiting on `login`.
+- **TOTP 2FA** on interactive login and **mutual TLS** between nodes are required, not optional (Sections 2 and 4.1.1). Rate limiting applies to `login` and to 2FA code attempts.
+- Optional hardening (stretch goals): per-node key rotation instead of one cluster secret, client-side encryption.
 
 ### 2.3 Encryption
 
@@ -188,7 +192,11 @@ All require `Authorization` (JWT or API key), except `register` and `login`.
 | Method | Path | Description |
 |---|---|---|
 | POST | `/v1/auth/register` | Creates a user |
-| POST | `/v1/auth/login` | Returns a JWT |
+| POST | `/v1/auth/login` | Credentials step: returns a JWT, or an MFA challenge if 2FA is enabled |
+| POST | `/v1/auth/login/2fa` | Code step: exchanges a challenge plus a TOTP (or recovery) code for a JWT |
+| POST | `/v1/auth/2fa/enroll` | Starts 2FA enrolment: returns the secret and its `otpauth://` URI, still disabled |
+| POST | `/v1/auth/2fa/verify` | Confirms enrolment with the first code; enables 2FA and returns the recovery codes **once** |
+| DELETE | `/v1/auth/2fa` | Disables 2FA (requires password **and** a valid code) |
 | POST | `/v1/auth/apikeys` | Creates an API key |
 | GET | `/v1/auth/apikeys` | Lists the caller's API keys (never the secret) |
 | DELETE | `/v1/auth/apikeys/{key_id}` | Revokes an API key |
@@ -197,16 +205,54 @@ All require `Authorization` (JWT or API key), except `register` and `login`.
 // POST /v1/auth/register
 { "username": "ana", "password": "********" }          // → 201 { "username": "ana" }
 
-// POST /v1/auth/login
+// POST /v1/auth/login   — user without 2FA
 { "username": "ana", "password": "********" }
 // → 200
 { "access_token": "<jwt>", "token_type": "bearer", "expires_in": 3600 }
+
+// POST /v1/auth/login   — same endpoint, user WITH 2FA enabled
+// → 200   (no token yet; the challenge is single-use and expires in MFA_CHALLENGE_TTL_S)
+{ "mfa_required": true, "challenge": "mfa_9f3a...", "expires_in": 300 }
+
+// POST /v1/auth/login/2fa
+{ "challenge": "mfa_9f3a...", "code": "492013" }       // 6-digit TOTP, or a recovery code
+// → 200
+{ "access_token": "<jwt>", "token_type": "bearer", "expires_in": 3600 }
+// → 401 UNAUTHORIZED      wrong, expired or already-used code
+// → 429 RATE_LIMITED      too many attempts on this challenge
 
 // POST /v1/auth/apikeys
 { "name": "laptop-cli" }
 // → 201   (api_key is returned only now)
 { "key_id": "k_81f3", "name": "laptop-cli", "api_key": "dfsha_live_9d2c...", "created_at": "2026-10-16T14:30:00Z" }
 ```
+
+### 4.1.1 Two-factor authentication
+
+```jsonc
+// POST /v1/auth/2fa/enroll          (authenticated, 2FA not yet enabled)
+// → 200   the secret is shown only here; 2FA stays DISABLED until /verify succeeds
+{ "secret": "E4B6LZGUR2JUDLFF...",
+  "otpauth_uri": "otpauth://totp/DFSha:ana?secret=E4B6...&issuer=DFSha",
+  "qr_png_base64": "iVBORw0KGgo..." }
+
+// POST /v1/auth/2fa/verify
+{ "code": "492013" }
+// → 200   recovery codes are returned once and never again
+{ "enabled": true,
+  "recovery_codes": ["7f2a-91bc", "3d10-4e77", "..."] }   // 10 single-use codes
+
+// DELETE /v1/auth/2fa
+{ "password": "********", "code": "492013" }               // → 200 { "enabled": false }
+```
+
+**Rules clients must respect**
+
+- `/v1/auth/login` may return **either** shape. A client must branch on `mfa_required` rather than assuming `access_token` is present.
+- The challenge is **not** a credential: it carries no authorization and is useless on any endpoint other than `/v1/auth/login/2fa`.
+- A code is accepted within a ±1 time-step window (30 s each) to absorb clock skew, and **cannot be reused** inside its own window.
+- **API keys bypass 2FA by design.** They are the non-interactive credential for scripts and automation; forcing a second factor on a process that would have to store it next to the first adds nothing. Use an API key, not a password, for unattended jobs.
+- 2FA is enforced at login only. Once issued, the JWT is a complete credential and records the factors used in its `amr` claim (`["pwd"]` or `["pwd","otp"]`).
 
 ### 4.2 Groups
 
@@ -599,11 +645,13 @@ These endpoints make the failover and re-replication demonstrable in the video (
 - **Fencing:** `term` is returned in every DataNode response and carried in commands; DataNodes ignore lower terms (Section 7).
 - **Discovery:** clients and DataNodes are configured with a list `NAMENODE_URLS=https://nn1…,https://nn2…`; they try them in order and follow `leader_url` when told.
 - **After failover:** the new leader loads the hard state from the database, marks all DataNodes "unknown" for `FAILOVER_GRACE_S`, then resumes normal liveness tracking from fresh heartbeats. DataNodes re-send their block reports as soon as they see the new `term`, which rebuilds the replica locations. Until then `commit` may answer `409 INSUFFICIENT_REPLICAS`; the client simply retries.
-- **Known limitation (to state in the report):** PostgreSQL itself is a single point of failure. Mitigation path: primary + streaming replica with promotion (stretch goal) or a managed multi-AZ database.
+- **The metadata store is replicated too:** primary plus a streaming hot standby locally, RDS Multi-AZ in the cloud. Two NameNodes in front of a single database would only move the single point of failure one layer down (`ARCHITECTURE.md` Section 5.2).
+- **Degraded mode:** if the leader cannot reach the database to renew its lease it does **not** step down, because no standby could take over either and the outage would become total. It keeps leadership and serves **reads from its cache** while answering `503` to every write, reporting `degraded: true`. The block channel is unaffected, so transfers already in progress continue.
 
 | Method | Path | Description |
 |---|---|---|
-| GET | `/v1/ha/status` | `{ "node_id": "nn1", "role": "leader" \| "standby", "term": 4, "leader_url": "https://nn1…", "lease_expires_at": "2026-10-16T14:30:20Z" }` |
+| GET | `/v1/ha/status` | `{ "node_id": "nn1", "role": "leader" \| "standby", "term": 4, "degraded": false, "leader_url": "https://nn1…", "lease_expires_at": "2026-10-16T14:30:20Z" }` |
+| POST | `/v1/ha/stepdown` | Admin-only: the leader releases its lease so the standby can take over (planned handover, and the clean way to demo a failover) |
 
 ---
 
@@ -673,7 +721,8 @@ c.commit_upload(alloc)                                # POST /v1/files/{id}/comm
 | 5 | Metadata store | **PostgreSQL**, shared by the NameNodes | ACID transactions, simple HA story |
 | 6 | Token secret distribution | Environment variable / secret on NameNodes and DataNodes only | Simplest; rotation by redeploy |
 | 7 | HA mechanism | **Lease row in PostgreSQL + `term` fencing** | Real failover to demonstrate, far less code than a custom consensus protocol |
-| 8 | Access control | **Users + groups + ACLs + API keys** (2FA as stretch) | Covers "user or group, up to API keys" in the statement |
+| 8 | Access control | **Users + groups + ACLs + API keys + TOTP 2FA** | The statement names the whole range, "from user/password, ACL, etc, up to 2FA, API Keys, etc". Both ends are implemented, not just one |
+| 9 | Node-to-node identity | **Mutual TLS** with per-node certificates from a cluster CA, in addition to the cluster secret | Answers "security between data and control nodes" with cryptographic per-node identity instead of one shared header value |
 | 9 | Protocols | **gRPC** for Client ↔ DataNode and DataNode ↔ DataNode (blocks); **REST** for Client ↔ NameNode and DataNode → NameNode | Streaming and pipelined replication where the data volume is; REST where simplicity, `curl` and `/docs` matter. The block service messages (`.proto`) are owned by the DataNode owner |
 
 ### Still open (non-blocking)
@@ -698,6 +747,7 @@ c.commit_upload(alloc)                                # POST /v1/files/{id}/comm
 
 | Version | Date | Change |
 |---|---|---|
+| 0.7 | 2026-10-18 | **TOTP two-factor authentication** (new Section 4.1.1, endpoints `/v1/auth/login/2fa` and `/v1/auth/2fa/*`, new `MFA_CHALLENGE_TTL_S`). **`/v1/auth/login` can now return two different shapes**, so clients must branch on `mfa_required` instead of assuming `access_token` — the only breaking part of this version. API keys are explicitly exempt from 2FA. **Mutual TLS** required on node-to-node channels (Section 2). Decisions 8 and 9 in Section 11 updated |
 | 0.6 | 2026-10-16 | Repository layout alignment: client library imported as `from client import DFShaClient` (was `from dfsha import ...`); docs reflect the `server/nodes/` package layout |
 | 0.5 | 2026-10-16 | NameNode state split: replica locations and DataNode liveness are **soft state** (leader's memory, rebuilt from heartbeats and block reports) and are no longer stored in PostgreSQL; DataNodes send a block report immediately when they see a higher `term`; `commit` may need a retry right after a failover; `ARCHITECTURE.md` renumbered (integration scenarios are now Section 12) |
 | 0.4 | 2026-10-16 | Block channel (Client ↔ DataNode, DataNode ↔ DataNode) moves from REST to **gRPC**; Client ↔ NameNode and DataNode → NameNode stay REST. `PUT/GET/HEAD /v1/blocks/{id}` replaced by `BlockService` (Section 6; messages to be defined in a `.proto` owned by the DataNode owner); `X-Block-Token` → `x-block-token` metadata; `X-Pipeline` and the checksum move into the first stream message; `url` / `internal_url` / `public_url` → `addr` / `internal_addr` / `public_addr` (**breaking** for `put`, `get`, `register` and `replicate`); new Section 3.1 (gRPC status codes); new `BLOCK_CHUNK_SIZE` |

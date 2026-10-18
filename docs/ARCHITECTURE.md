@@ -654,12 +654,13 @@ Tips: rehearse once, keep a pre-recorded backup of the slowest steps, use the de
 
 ## 15. Known limitations (state them openly)
 
-- PostgreSQL is a single point of failure unless a replica is added.
+- If **both** database nodes are lost, metadata writes stop: the service degrades to read-only rather than going down (Section 5.2), but it cannot accept changes. The replica and RDS Multi-AZ reduce this to a correlated-failure scenario; they do not eliminate it.
 - The leader NameNode is the only writer of metadata (bottleneck at very large scale).
 - After a failover there is a short window (`FAILOVER_GRACE_S` plus the block reports) in which the leader does not yet know where replicas are, so `commit` may need a retry.
-- `put` allocates all blocks up front; maximum file size is bounded.
-- WORM only: no in-place partial updates.
-- Client-side encryption, 2FA and mutual TLS are stretch goals.
+- WORM only: no in-place partial updates. `write` at file level is expressed as a new version (Section 11, decision 3 of `API.md`).
+- The cluster needs **more DataNodes than the replication factor** to partition and to repair at all (Section 6.2). With exactly three nodes and factor 3 the system still works, but it mirrors instead of partitioning and cannot re-replicate.
+- Client-side encryption is a stretch goal.
+- Full POSIX access transparency (a FUSE mount) is not provided: the client exposes dynamic location transparency through a CLI and a library, which the statement allows, but existing programs cannot open DFSha paths directly. A read-only mount is the natural extension (Section 16, decision D).
 - The block channel uses gRPC: it cannot be called from a browser or with plain `curl`, and debugging it needs `grpcurl` (with server reflection enabled in development).
 - gRPC needs HTTP/2 end to end: any load balancer or proxy placed in front of the DataNodes must support it.
 

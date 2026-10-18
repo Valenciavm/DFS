@@ -392,7 +392,7 @@ There are **no** `datanodes` or `block_replicas` tables: that information is sof
 >
 > Hence the minimum of **five DataNodes** in Section 10. With five nodes and factor 3 each node holds roughly three fifths of the blocks: no node has the whole file, every block still has three copies, and both properties are observable and independent.
 
-**6.5 Incremental block allocation.**
+**6.3 Incremental block allocation.**
 `put` does **not** allocate the whole file up front. It reserves the path and returns a `file_id`; the client then requests blocks in batches as it uploads, and declares the total size at `commit`.
 
 Allocating everything in one response had four problems, all of them growing with file size:
@@ -408,10 +408,17 @@ With batched allocation each batch gets fresh tokens and pipelines computed from
 
 This changes the contract in `API.md` Sections 5.1 and 5.5, so it lands with a version bump when it is implemented, not before.
 
-**6.3 Allocation versus confirmation.**
+**6.4 Allocation versus confirmation.**
 The pipeline is only the plan. A node counts as a replica of a block when it confirms (`block-received`) or reports the block in a block report. The write quorum (`MIN_REPLICAS_COMMIT`) is checked against **confirmed** replicas, never against the pipeline.
 
-**6.4 Re-replication.**
+**6.5 Surviving a dead hop in the pipeline.**
+A pipeline is a chain, so a node that dies in the **middle** of it would cut off everything behind it. Measured on a three-node chain with the middle node down: the first node stored its copy and reported the failure, the third node was alive and next in line but never received the block, and what should have been three replicas was one — below `MIN_REPLICAS_COMMIT`, so the whole block would have to be re-uploaded.
+
+Therefore a node that cannot reach `pipeline[0]` **tries the next entries in order** and forwards to the first one that answers, passing the rest of the chain along. The addresses it skipped are returned in `failed_downstream` so the NameNode can account for them. Three replicas degrade to two, the write quorum is still met and `commit` succeeds; re-replication restores the third copy afterwards. Only when no remaining hop answers does the client have to retry the block with a fresh pipeline.
+
+This is what makes a DataNode failure during a write survivable rather than merely reportable.
+
+**6.6 Re-replication.**
 - Blocks are examined only for `COMMITTED` files.
 - Priority: blocks with the fewest live replicas first (a block with 1 live replica before one with 2).
 - Source: a live node that holds the block. Target: a live node with free space that does not hold it.
@@ -440,7 +447,7 @@ The pipeline is only the plan. A node counts as a replica of a block when it con
 | Failure | Outcome |
 |---|---|
 | DataNode dies during a read | Client falls back to another replica; no error for the user |
-| DataNode dies during a write | Pipeline continues with the remaining nodes; `commit` succeeds if the quorum is met, otherwise the client retries the block with a fresh pipeline (`/tokens`) |
+| DataNode dies during a write | The upstream node **skips the dead hop and forwards to the next live node of the pipeline** (Section 6.5), so the chain degrades from 3 replicas to 2 instead of collapsing to 1; `commit` then still meets the quorum. Only if too few hops survive does the client retry the block with a fresh pipeline (`/tokens`) |
 | DataNode dies permanently | Blocks re-replicated onto other nodes; `under_replicated_blocks` returns to 0 |
 | DataNode returns after a long absence | Its block report reveals stale/surplus replicas; surplus ones are deleted |
 | Client dies mid-upload | Reservation expires after `UPLOAD_TTL_S`; the garbage collector marks it `ABORTED` and deletes the reserved blocks |
@@ -459,7 +466,7 @@ The pipeline is only the plan. A node counts as a replica of a block when it con
 | Dimension | How DFSha scales / what limits it |
 |---|---|
 | **Storage capacity & throughput** | Add DataNodes: they register themselves and receive new blocks (free-space-weighted placement). Clients move bytes **directly** to/from DataNodes, so aggregate throughput grows with the number of nodes. |
-| **File size** | Files are split into blocks; blocks are placed independently, and blocks are **allocated in batches as the upload progresses** (Section 6.5), so neither the `put` response nor the reserved capacity grows with the file. No architectural bound on file size; `MAX_FILE_SIZE_BYTES` survives only as an optional per-user quota. |
+| **File size** | Files are split into blocks; blocks are placed independently, and blocks are **allocated in batches as the upload progresses** (Section 6.3), so neither the `put` response nor the reserved capacity grows with the file. No architectural bound on file size; `MAX_FILE_SIZE_BYTES` survives only as an optional per-user quota. |
 | **Number of files** | Hard state in PostgreSQL with indexes on `(parent_id, name)`; `ls` is paginated; the leader serves reads from an in-memory cache. Rough order of magnitude: 1 PB at 64 MB blocks ≈ 16 million block rows — manageable for PostgreSQL. |
 | **Number of users** | The NameNode does small work per request (no data passes through it). Block tokens are validated by DataNodes locally, with no NameNode round trip. |
 | **Concurrency** | Parallel block transfers in the client; concurrent readers and writers on different paths; the NameNode core is atomic per call (Section 4.4). |
@@ -717,7 +724,7 @@ What `models.py` and `namenode.py` already match, and what must change. "Adopted
 
 | # | Where | Current behavior | Target |
 |---|---|---|---|
-| 1 | `prepare_file_upload` | `replicas` is filled with the pipeline at allocation time | Keep a separate `pipeline` (plan); `replicas` only from `block-received` / block reports (Section 6.3) |
+| 1 | `prepare_file_upload` | `replicas` is filled with the pipeline at allocation time | Keep a separate `pipeline` (plan); `replicas` only from `block-received` / block reports (Section 6.4) |
 | 2 | `monitor_datanodes`, `record_heartbeat`, `DataNodeInfo` | Loop time (`monotonic`) compared with `time.time()` defaults, so a node that registers and never sends a heartbeat is never marked dead | One monotonic clock for liveness (Section 4.4) |
 | 3 | `monitor_replication` | Iterates all blocks, including those of `PENDING` files | Only blocks of `COMMITTED` files (Section 4.2) |
 | 4 | `prepare_file_upload` | One pipeline reused for every block | Pipeline chosen per block, weighted by free space (Section 6.2) |

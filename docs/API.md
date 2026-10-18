@@ -62,7 +62,7 @@ Clients only ever receive `public_addr` values (called `addr` in the NameNode re
 | `BLOCK_CHUNK_SIZE` | 1 MiB | Size of each streamed chunk on the gRPC block channel (a DataNode rejects chunks above 2 MiB) |
 | `REPLICATION_FACTOR` | 3 | Target replicas per block |
 | `MIN_REPLICAS_COMMIT` | 2 | Write quorum: minimum confirmed replicas per block to allow `commit` |
-| `MAX_FILE_SIZE_BYTES` | 10 GB | In this version `put` allocates all blocks up front, so file size is bounded. Batched allocation is already designed (`ARCHITECTURE.md` Section 6.5) and will relax this to an optional quota; it changes Sections 5.1 and 5.5 and lands with its own version bump |
+| `MAX_FILE_SIZE_BYTES` | 10 GB | In this version `put` allocates all blocks up front, so file size is bounded. Batched allocation is already designed (`ARCHITECTURE.md` Section 6.3) and will relax this to an optional quota; it changes Sections 5.1 and 5.5 and lands with its own version bump |
 | `HEARTBEAT_INTERVAL_S` | 5 | DataNode → NameNode |
 | `DEAD_NODE_TIMEOUT_S` | 30 | No heartbeat for this long ⇒ node is considered dead |
 | `BLOCK_REPORT_INTERVAL_S` | 60 | DataNode → NameNode |

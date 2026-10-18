@@ -1,4 +1,4 @@
-# DFSha — API Contract (v0.5)
+# DFSha — API Contract (v0.6)
 
 > **Team rule:** this document is the source of truth for how the components talk to each other.
 > Any change is made through a Pull Request, and the other two teammates are notified before it is merged.
@@ -612,7 +612,7 @@ These endpoints make the failover and re-replication demonstrable in the video (
 The CLI is a thin layer over a library. Everything in the CLI is also available programmatically; this is the "basic read/write API for files and blocks from the client" required by the project.
 
 ```python
-from dfsha import DFShaClient
+from client import DFShaClient
 
 c = DFShaClient(["https://nn1.example.com", "https://nn2.example.com"])   # NameNode list (HA)
 c.login("ana", "********")                       # or: c.use_api_key("dfsha_live_...")
@@ -698,6 +698,7 @@ c.commit_upload(alloc)                                # POST /v1/files/{id}/comm
 
 | Version | Date | Change |
 |---|---|---|
+| 0.6 | 2026-10-16 | Repository layout alignment: client library imported as `from client import DFShaClient` (was `from dfsha import ...`); docs reflect the `server/nodes/` package layout |
 | 0.5 | 2026-10-16 | NameNode state split: replica locations and DataNode liveness are **soft state** (leader's memory, rebuilt from heartbeats and block reports) and are no longer stored in PostgreSQL; DataNodes send a block report immediately when they see a higher `term`; `commit` may need a retry right after a failover; `ARCHITECTURE.md` renumbered (integration scenarios are now §12) |
 | 0.4 | 2026-10-16 | Block channel (Client ↔ DataNode, DataNode ↔ DataNode) moves from REST to **gRPC**; Client ↔ NameNode and DataNode → NameNode stay REST. `PUT/GET/HEAD /v1/blocks/{id}` replaced by `BlockService` (Section 6; messages to be defined in a `.proto` owned by the DataNode owner); `X-Block-Token` → `x-block-token` metadata; `X-Pipeline` and the checksum move into the first stream message; `url` / `internal_url` / `public_url` → `addr` / `internal_addr` / `public_addr` (**breaking** for `put`, `get`, `register` and `replicate`); new Section 3.1 (gRPC status codes); new `BLOCK_CHUNK_SIZE` |
 | 0.3 | 2026-10-16 | Closed decisions (WORM, DataNode-side AES-256-GCM, PostgreSQL, lease + fencing HA); added locks (`423 LOCKED`), groups, group ACLs, API keys, audit log, `X-Request-Id`, `term` in DataNode responses, `FAILOVER_GRACE_S`, `/v1/ha/status` replaces `/v1/ha/sync`, `BLOCK_SIZE` default 64 MB, client `open`/`close`/`lock`/`begin_upload`/`commit_upload`, `ARCHITECTURE.md` |

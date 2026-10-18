@@ -1,6 +1,6 @@
 # DFSha — Data Plane: gRPC BlockService and Pipeline Replication
 
-Implementation notes for the **data plane**: the gRPC service the DataNodes expose, how a block travels along a write pipeline, and how to run and test it. The contract this must obey is [`API.md`](API.md) §6 (if they disagree, `API.md` wins); the design rationale is in [`ARCHITECTURE.md`](ARCHITECTURE.md) §2 and §7.
+Implementation notes for the **data plane**: the gRPC service the DataNodes expose, how a block travels along a write pipeline, and how to run and test it. The contract this must obey is [`API.md`](API.md) Section 6 (if they disagree, `API.md` wins); the design rationale is in [`ARCHITECTURE.md`](ARCHITECTURE.md) Section 2 and Section 7.
 
 Code: `proto/block_service.proto`, `server/nodes/datanode/`.
 
@@ -51,7 +51,7 @@ sequenceDiagram
 
 `pipeline` holds the `internal_addr` of the nodes that **still** have to receive the block, so each node pops itself off and passes the rest downstream. It is empty on the last node.
 
-**Generated stubs are not committed** (`ARCHITECTURE.md` §10). Generate them before running anything:
+**Generated stubs are not committed** (`ARCHITECTURE.md` Section 10). Generate them before running anything:
 
 ```powershell
 python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. proto/block_service.proto
@@ -104,17 +104,21 @@ Send a block to `dn1` with `pipeline=["127.0.0.1:9002"]` and both `./data/dn1/<b
 
 ## 5. Not implemented yet
 
-Tracked here so the gaps against `API.md` §6 are explicit:
+Tracked here so the gaps against `API.md` Section 6 are explicit:
 
-| Gap | Contract reference |
-|---|---|
-| TLS on the block channel (channels are insecure today) | §2.3 |
-| `x-block-token` validation in a server interceptor | §2.1 |
-| AES-256-GCM encryption at rest | §2.3 |
-| `StatBlock` implementation | §6.4 |
-| Ranged `ReadBlock` (`offset` / `length` are ignored; the whole block is read into memory) | §6.3 |
-| Idempotent writes (`already_existed` is always `false`) | §6.2 |
-| REST calls to the NameNode: `register`, `heartbeat`, `block-report`, `block-received`, `block-corrupt` | §7 |
-| `x-dfsha-error-code` in trailing metadata | §3.1 |
-| Chunk size is 64 KB; the contract default is `BLOCK_CHUNK_SIZE` = 1 MiB | §1 |
-| Server reflection for `grpcurl` in development | §6.5 |
+Section references are to [`API.md`](API.md) unless stated otherwise.
+
+| Gap | Why it matters | Reference |
+|---|---|---|
+| **Skip a dead hop in the pipeline.** A node that cannot reach `pipeline[0]` gives up on the rest of the chain instead of trying the next entry, so one dead node in the middle leaves a single replica instead of two | Measured: three-node chain with the middle node down produced 1 replica, below `MIN_REPLICAS_COMMIT`, forcing a full re-upload. Hits availability and replication directly | `ARCHITECTURE.md` Section 6.5 |
+| **Ranged `ReadBlock`** — `offset` and `length` are ignored and the whole block is read into memory | The statement requires concurrency on "data within a file"; random access depends on this, and loading a 64 MB block to serve 4 KB does not scale | Section 6.3 |
+| TLS on the block channel (channels are insecure today) | Encryption in transit | Section 2.3 |
+| `x-block-token` validation in a server interceptor | Any client can currently read or write any block | Section 2.1 |
+| AES-256-GCM encryption at rest | Encryption in storage | Section 2.3 |
+| Mutual TLS between DataNodes | Node-to-node identity | Section 2 |
+| REST calls to the NameNode: `register`, `heartbeat`, `block-report`, `block-received`, `block-corrupt` | Without these the NameNode cannot count replicas, detect dead nodes or order repairs | Section 7 |
+| `StatBlock` implementation | Declared in the `.proto`, unimplemented | Section 6.4 |
+| Idempotent writes (`already_existed` is always `false`) | Retries currently rewrite the block | Section 6.2 |
+| `x-dfsha-error-code` in trailing metadata | Error model parity with REST | Section 3.1 |
+| Chunk size is 64 KB; the contract default is `BLOCK_CHUNK_SIZE` = 1 MiB | Throughput tuning (experiment in `ARCHITECTURE.md` Section 11) | Section 1 |
+| Server reflection for `grpcurl` in development | Debuggability | Section 6.5 |

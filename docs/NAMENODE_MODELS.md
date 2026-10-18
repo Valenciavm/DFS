@@ -1,4 +1,4 @@
-# DFSha — NameNode Metadata Models (v0.3)
+# DFSha — NameNode Metadata Models (v0.4)
 
 Code-level reference for `server/nodes/namenode/models.py`. It complements [`ARCHITECTURE.md`](ARCHITECTURE.md) (Section 5 explains the design, this file gives the Python shape) and follows the contract in [`API.md`](API.md). If they disagree, `API.md` wins for what crosses the wire and `ARCHITECTURE.md` wins for design.
 
@@ -97,9 +97,9 @@ classDiagram
 - All models are `@dataclass`. Mutable defaults always use `field(default_factory=...)`; a bare `= []` or `= {}` is a bug (shared between instances).
 - Timestamps are **UTC wall-clock** `float` seconds since epoch (`time.time()`), because they are persisted. Liveness checks use a **monotonic** clock kept separately (`last_seen_monotonic` in `ClusterState`), never `time.time()`, so clock jumps cannot kill nodes.
 - Ids are opaque strings. Nobody except the NameNode parses them.
-- Addresses are `host:port` (no scheme): gRPC targets, as in `API.md` §1.
+- Addresses are `host:port` (no scheme): gRPC targets, as in `API.md` Section 1.
 - Sizes are in bytes (`int`).
-- Models contain data and tiny derived helpers only. Rules (placement, quorum, re-replication) live in the NameNode core (`ARCHITECTURE.md` §4.3, §6).
+- Models contain data and tiny derived helpers only. Rules (placement, quorum, re-replication) live in the NameNode core (`ARCHITECTURE.md` Sections 4.3 and 6).
 
 ---
 
@@ -140,7 +140,7 @@ The whole logical file.
 
 | Field | Type | Description |
 |---|---|---|
-| `file_id` | `str` | Unique id assigned at `put` (UUID vs prefixed id is open decision in `ARCHITECTURE.md` §16) |
+| `file_id` | `str` | Unique id assigned at `put` (UUID vs prefixed id is open decision in `ARCHITECTURE.md` Section 16) |
 | `name` | `str` | Name inside its directory. The full path is computed from the parent chain |
 | `owner` | `str` | Username from the authenticated principal |
 | `size_bytes` | `int` | Declared size; verified against the sum of block sizes at `commit` |
@@ -226,7 +226,7 @@ If every directory and file stored its full path, moving a directory would requi
 | `is_alive` | `bool` | Set by `monitor_datanodes` after `DEAD_NODE_TIMEOUT_S` without a heartbeat |
 
 Derived: `free_bytes() = max(0, capacity_bytes - used_bytes)`.
-(The earlier `address` field is split into `internal_addr` / `public_addr`, see `API.md` §1.)
+(The earlier `address` field is split into `internal_addr` / `public_addr`, see `API.md` Section 1.)
 
 ### 6.2 `ClusterState`
 
@@ -238,12 +238,16 @@ Everything the leader learns from DataNodes. Lost on failover by design; rebuilt
 | `replicas` | `dict[str, set[str]]` | `block_id → node_ids` that **confirmed** a valid copy (via `block-received` or block report) |
 | `pipelines` | `dict[str, list[str]]` | `block_id → ordered node_ids` **allocated** for an upload. Allocation, not confirmation |
 | `pending_commands` | `dict[str, list[Command]]` | `node_id → commands` (`replicate`, `delete`) delivered in the next heartbeat response |
-| `in_flight_replications` | `dict[str, set[str]]` | `block_id → target node_ids` being copied, so the same block is not scheduled twice |
-| `reserved_bytes` | `dict[str, int]` | `node_id → bytes` promised to uploads in progress; subtracted from free space until a heartbeat covers it |
+| `replica_checksums` | `dict[str, dict[str, str]]` | `block_id → {node_id → checksum}` each confirming node computed. `commit` compares it with the checksum the client sent, which a bare set of ids cannot do |
+| `in_flight_replications` | `dict[str, dict[str, float]]` | `block_id → {target node_id → monotonic start}` being copied, so the same block is not scheduled twice and a copy that never finishes can time out |
+| `reserved_bytes` | `dict[str, int]` | `node_id → bytes` promised to uploads and copies in progress; subtracted from free space by placement |
+| `reservations` | `dict[str, dict[str, int]]` | `block_id → {node_id → bytes}` still held. Tracked per pair so a reservation is released **exactly once** however it ends (confirmed, committed, aborted, timed out, node died). Deriving it from `pipelines` minus `replicas` would release twice when a replica is later lost |
 
-Pipeline vs replicas is the key distinction: a block with 3 nodes in `pipelines` and 2 in `replicas` has been written to 2 nodes so far. `commit` succeeds when `len(replicas[block]) >= MIN_REPLICAS_COMMIT` for **every** block.
+Pipeline vs replicas is the key distinction: a block with 3 nodes in `pipelines` and 2 in `replicas` has been written to 2 nodes so far. `commit` succeeds when `len(replicas[block]) >= MIN_REPLICAS_COMMIT` for **every** block, counting only replicas on live nodes whose checksum equals the client's.
 
-Concurrency: all mutations happen on the event loop or under one lock; background tasks iterate over **snapshots** (`list(d.items())`), never the live dict (`ARCHITECTURE.md` §4.4).
+**Where the reservation is released.** The earlier draft released it when a heartbeat "covered" the space. The code releases it at the precise event instead: when that node confirms the block, when the upload commits (unconfirmed hops never arrive), when it is aborted or expires, or when a copy times out or its target dies. A heartbeat cannot know which blocks it accounts for, so releasing on heartbeats either leaks space or frees it too early.
+
+Concurrency: all mutations happen on the event loop or under one lock; background tasks iterate over **snapshots** (`list(d.items())`), never the live dict (`ARCHITECTURE.md` Section 4.4).
 
 ---
 
@@ -258,7 +262,7 @@ Concurrency: all mutations happen on the event loop or under one lock; backgroun
 | pipeline (soft) | `pipeline` in the `prepare` / `tokens` response, built from `internal_addr` | none |
 | `DataNodeInfo` | register / heartbeat payloads | none |
 
-Note what goes to the client: block locations use `public_addr`; the pipeline inside the write header uses `internal_addr` (`API.md` §1, §6.2).
+Note what goes to the client: block locations use `public_addr`; the pipeline inside the write header uses `internal_addr` (`API.md` Sections 1 and 6.2).
 
 ---
 
@@ -273,6 +277,6 @@ Note what goes to the client: block locations use `public_addr`; the pipeline in
 | 5 | `MetadataStore` held `datanodes` | `ClusterState` holds them | Keeps the persisted interface limited to hard state |
 | 6 | `DataNodeInfo.address` | `internal_addr` + `public_addr` + monotonic `last_seen_monotonic` | gRPC block channel, clients vs DataNodes, clock safety |
 | 7 | `@dataclass` and indexes listed as "future recommendations" | Mandatory (Sections 2 and 4.4) | Avoids shared-mutable-default bugs; indexes are required for block reports |
-| 8 | In-memory only | `MetadataStore` interface with PostgreSQL as the real implementation; in-memory fake for tests | High availability is part of the design from the start (`ARCHITECTURE.md` §5.2) |
+| 8 | In-memory only | `MetadataStore` interface with PostgreSQL as the real implementation; in-memory fake for tests | High availability is part of the design from the start (`ARCHITECTURE.md` Section 5.2) |
 
-Open points that still affect these models are tracked in `ARCHITECTURE.md` §16 (namespace per user vs ACL sharing, `file_id` format).
+Open points that still affect these models are tracked in `ARCHITECTURE.md` Section 16 (namespace per user vs ACL sharing, `file_id` format).

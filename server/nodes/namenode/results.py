@@ -38,3 +38,21 @@ class CommittedBlock:
     block_id: str
     size: int
     checksum: str
+
+
+@dataclass(frozen=True)
+class BlockLocation:
+    """A block of a committed file, with where to read it from."""
+
+    block: BlockMetadata
+    token: str                   # read token bound to this block
+    replicas: list[DataNodeInfo]  # live nodes only, in the order the client should try them
+
+
+@dataclass(frozen=True)
+class FileLocation:
+    """What ``get`` returns (``API.md`` Section 5.3)."""
+
+    file: FileMetadata
+    path: str
+    blocks: list[BlockLocation]

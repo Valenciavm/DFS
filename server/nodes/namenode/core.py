@@ -33,8 +33,18 @@ from server.nodes.namenode.models import (
     FileMetadata,
     FileStatus,
 )
-from server.nodes.namenode.results import CommittedBlock, PlannedBlock, UploadPlan
-from server.nodes.namenode.store import InMemoryMetadataStore, MetadataStore
+from server.nodes.namenode.results import (
+    BlockLocation,
+    CommittedBlock,
+    FileLocation,
+    PlannedBlock,
+    UploadPlan,
+)
+from server.nodes.namenode.store import (
+    DirEntry,
+    InMemoryMetadataStore,
+    MetadataStore,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -487,3 +497,72 @@ class Namenode:
     def _release_block_reservations(self, block_id: str) -> None:
         for node_id in list(self.cluster.reservations.get(block_id, {})):
             self._release_reservation(block_id, node_id)
+
+    # ---- reading ---------------------------------------------------------
+
+    def get_file_blocks(self, path: str, user: str) -> FileLocation:
+        """Step 1 of ``get`` (``API.md`` Section 5.3): the block map of a committed file.
+
+        Only **live** replicas are listed, in random order so that readers spread
+        over the replicas instead of all hitting the first one. A pending upload
+        is invisible here, so a reader sees the complete old version or the
+        complete new one, never a mix.
+        """
+        if not user:
+            raise DfshaError(ErrorCode.BAD_REQUEST, "a read needs a user")
+        canonical = join_path(split_path(path))
+        node = self.store.stat(canonical)
+        if node is None:
+            raise DfshaError(ErrorCode.FILE_NOT_FOUND, f"{canonical} does not exist")
+        if isinstance(node, DirectoryMetadata):
+            raise DfshaError(ErrorCode.IS_A_DIRECTORY, f"{canonical} is a directory")
+
+        now = self.clock.time()
+        located: list[BlockLocation] = []
+        for block in node.blocks:
+            replicas = [self.cluster.datanodes[nid] for nid in self._live_holders(block.block_id)]
+            self.rng.shuffle(replicas)
+            token = mint(
+                block.block_id, BlockOp.READ, user,
+                self.settings.block_token_secret, self.settings.token_ttl_s, now=now,
+            )
+            located.append(BlockLocation(block=block, token=token, replicas=replicas))
+        return FileLocation(file=node, path=canonical, blocks=located)
+
+    # ---- file system operations (RF1) -------------------------------------
+
+    def mkdir(self, path: str, owner: str, parents: bool = False) -> DirectoryMetadata:
+        if not owner:
+            raise DfshaError(ErrorCode.BAD_REQUEST, "a directory needs an owner")
+        return self.store.mkdir(path, owner, self.clock.time(), parents=parents)
+
+    def ls(self, path: str) -> list[DirEntry]:
+        return self.store.list_dir(path)
+
+    def stat(self, path: str) -> DirectoryMetadata | FileMetadata:
+        node = self.store.stat(path)
+        if node is None:
+            raise DfshaError(ErrorCode.FILE_NOT_FOUND, f"{join_path(split_path(path))} does not exist")
+        return node
+
+    def rm(self, path: str) -> FileMetadata:
+        """Removes a file. It vanishes from ``ls`` at once; its blocks are deleted
+        afterwards through ``delete`` commands (``API.md`` Section 4.3)."""
+        file = self.store.remove_file(path, self.clock.time())
+        self._schedule_deletion(file.blocks)
+        return file
+
+    def rmdir(self, path: str, recursive: bool = False) -> int:
+        """Removes a directory and returns how many files went with it."""
+        removed = self.store.remove_dir(path, recursive, self.clock.time())
+        for file in removed:
+            self._schedule_deletion(file.blocks)
+        return len(removed)
+
+    def _live_holders(self, block_id: str) -> list[str]:
+        """Ids of live nodes that have confirmed a copy of the block, sorted."""
+        holders = self.cluster.replicas.get(block_id, set())
+        return sorted(
+            nid for nid in holders
+            if (node := self.cluster.datanodes.get(nid)) is not None and node.is_alive
+        )

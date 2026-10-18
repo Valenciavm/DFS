@@ -1,175 +1,809 @@
-import os
+"""NameNode core: the rules of the control plane, with no web code.
+
+A plain class so it can be unit tested with a fake clock and an in-memory store
+(``ARCHITECTURE.md`` Section 4.1). The REST layer is a thin adapter on top.
+
+Concurrency (Section 4.4): every public method is synchronous and runs to
+completion without yielding, so when the REST handlers and the background loops
+share one event loop each call is atomic. Background tasks iterate over
+snapshots (``list(...)``), never over a dictionary another call may be changing.
+
+Time (Section 4.4): liveness uses the monotonic clock, anything stored or
+compared across processes uses the wall clock, and the two are never subtracted
+from each other.
+"""
+from __future__ import annotations
+
 import asyncio
-import math
+import logging
+import random
+import re
 import uuid
-from typing import Optional
-from server.nodes.namenode.cluster_state import DataNodeInfo
+from collections.abc import Callable
+
+from server.common.clock import Clock, SystemClock
+from server.common.config import ConfigError, Settings
+from server.common.config import settings as default_settings
+from server.common.errors import DfshaError, ErrorCode
+from server.common.paths import join_path, split_path
+from server.common.tokens import SYSTEM_PRINCIPAL, BlockOp, mint
+from server.nodes.namenode import placement
+from server.nodes.namenode.cluster_state import ClusterState, Command, DataNodeInfo
 from server.nodes.namenode.models import (
-    MetadataStore,
-    FileMetadata,
     BlockMetadata,
+    DirectoryMetadata,
+    FileMetadata,
     FileStatus,
 )
+from server.nodes.namenode.results import (
+    BlockLocation,
+    ClusterStats,
+    CommittedBlock,
+    FileLocation,
+    GcResult,
+    PlannedBlock,
+    ReplicationScan,
+    ReportedBlock,
+    UploadPlan,
+)
+from server.nodes.namenode.store import (
+    DirEntry,
+    InMemoryMetadataStore,
+    MetadataStore,
+)
 
-# Configuration defaults
-DEFAULT_BLOCK_SIZE = 4 * 1024 * 1024  # 4 MB
-DEFAULT_REPLICATION_FACTOR = 3
-HEARTBEAT_TIMEOUT_SECONDS = 30  # DataNode considered dead after this
-UPLOAD_TTL_SECONDS = 300  # 5 minutes to complete upload before cleanup
+logger = logging.getLogger(__name__)
+
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+
+#: A copy that has not been confirmed after this long is given up on, so one lost
+#: command cannot block the repair of a block forever. Monotonic seconds.
+IN_FLIGHT_TIMEOUT_S = 120
+
+#: Periods of the background tasks (``ARCHITECTURE.md`` Section 4.2), in seconds.
+LIVENESS_PERIOD_S = 5
+REPLICATION_PERIOD_S = 10
+GC_PERIOD_S = 30
 
 
 class Namenode:
+    """The leader's view of the namespace and of the cluster."""
+
     def __init__(
         self,
-        block_size: int = DEFAULT_BLOCK_SIZE,
-        replication_factor: int = DEFAULT_REPLICATION_FACTOR,
-    ):
-        self._store = MetadataStore()
-        self.block_size = block_size
-        self.replication_factor = replication_factor
-        # Replication and cleanup queues for heartbeats
-        self.pending_replications: list[dict] = []  # commands for datanodes
-        self.pending_deletions: list[dict] = []
-
-    async def run(self):
-        """Main lifecycle running parallel background tasks."""
-        await asyncio.gather(
-            self.api_server(),               # Servidor HTTP/gRPC para atender clientes y DataNodes
-            self.monitor_datanodes(),        # Revisa periódicamente si algún DataNode murió
-            self.monitor_replication(),      # Detecta bloques sub-replicados y programa su copia
-            self.garbage_collector(),        # Limpia uploads pendientes vencidos y bloques huérfanos
+        settings: Settings | None = None,
+        store: MetadataStore | None = None,
+        clock: Clock | None = None,
+        rng: random.Random | None = None,
+    ) -> None:
+        self.settings = settings if settings is not None else default_settings
+        if not self.settings.block_token_secret:
+            # fail at startup: a NameNode without it would issue tokens nobody can verify
+            raise ConfigError("BLOCK_TOKEN_SECRET must be set: block tokens are signed with it")
+        self.clock: Clock = clock if clock is not None else SystemClock()
+        self.rng = rng if rng is not None else random.Random()
+        self.store: MetadataStore = (
+            store if store is not None else InMemoryMetadataStore(now=self.clock.time())
         )
+        self.cluster = ClusterState()
+        #: leadership generation; fixed at 1 until the lease is implemented
+        self.term = 1
+        #: monotonic instant until which nobody is declared dead after a failover
+        self._grace_until = 0.0
 
-    # -------------------------------------------------------------------------
-    # Background Tasks (async loops)
-    # -------------------------------------------------------------------------
+    # ---- DataNode registry and liveness ----------------------------------
 
-    async def api_server(self):
-        """Starts and maintains the API server alive (FastAPI / gRPC)."""
-        # Aquí se inicia el servidor (ej. uvicorn o grpc.aio.server)
-        while True:
-            await asyncio.sleep(3600)
+    def register_datanode(
+        self,
+        node_id: str,
+        internal_addr: str,
+        public_addr: str,
+        capacity_bytes: int,
+        used_bytes: int = 0,
+    ) -> DataNodeInfo:
+        """Creates or refreshes a DataNode. Replica locations already known survive.
 
-    async def monitor_datanodes(self):
-        """Busca datanodes muertos que no hayan respondido """
-        while True:
-            now = asyncio.get_event_loop().time()
-            # Marca como caídos los nodos que no hayan enviado heartbeat
-            for node_id, node in self._store.datanodes.items():
-                if node.is_alive and (now - node.last_heartbeat > HEARTBEAT_TIMEOUT_SECONDS):
-                    node.is_alive = False
-                    print(f"[NameNode] DataNode {node_id} dead (no heartbeat).")
-            await asyncio.sleep(5)
+        Called on startup, after a restart, and whenever a heartbeat was answered
+        with ``NODE_NOT_REGISTERED`` (``ARCHITECTURE.md`` Section 16, decision 19).
+        """
+        if not node_id or not isinstance(node_id, str):
+            raise DfshaError(ErrorCode.BAD_REQUEST, "node_id must be a non-empty string")
+        if not internal_addr or not public_addr:
+            raise DfshaError(ErrorCode.BAD_REQUEST, "internal_addr and public_addr are required")
+        if capacity_bytes < 0 or used_bytes < 0:
+            raise DfshaError(ErrorCode.BAD_REQUEST, "capacity and usage cannot be negative")
 
-    async def monitor_replication(self):
-        """Escanea bloques y programa replicas si el numero de réplicas es menor al replication factor"""
-        while True:
-            # Revisa bloques de archivos confirmados
-            for block_id, block in self._store.blocks_by_id.items():
-                alive_replicas = [
-                    nid for nid in block.replicas
-                    if nid in self._store.datanodes and self._store.datanodes[nid].is_alive
-                ]
-                if len(alive_replicas) < self.replication_factor:
-                    # Encolar orden de re-replicación hacia otro DataNode vivo
-                    pass
-            await asyncio.sleep(10)
+        node = self.cluster.datanodes.get(node_id)
+        if node is None:
+            node = DataNodeInfo(node_id, internal_addr, public_addr, capacity_bytes, used_bytes)
+            self.cluster.datanodes[node_id] = node
+        else:
+            node.internal_addr = internal_addr
+            node.public_addr = public_addr
+            node.capacity_bytes = capacity_bytes
+            node.used_bytes = used_bytes
+        self._mark_seen(node)
+        return node
 
-    async def garbage_collector(self):
-        """Limpia la cache, archivos pendientes expirados y bloques huérfanos"""
-        while True:
-            # Limpieza de archivos PENDING expirados
-            await asyncio.sleep(30)
+    def record_heartbeat(
+        self,
+        node_id: str,
+        free_bytes: int,
+        used_bytes: int,
+        active_transfers: int = 0,
+    ) -> list[Command]:
+        """Refreshes liveness and free space; returns the node's pending commands.
 
-    # -------------------------------------------------------------------------
-    # Core File Metadata Operations (Called by the API server)
-    # -------------------------------------------------------------------------
+        ``NODE_NOT_REGISTERED`` for an unknown node. That is the normal path after
+        a failover or a NameNode restart, not a fault: the DataNode registers
+        again and sends a full block report.
+        """
+        node = self._known(node_id)
+        if free_bytes < 0 or used_bytes < 0:
+            raise DfshaError(ErrorCode.BAD_REQUEST, "free and used bytes cannot be negative")
+        node.used_bytes = used_bytes
+        node.capacity_bytes = used_bytes + free_bytes  # the node reports the truth
+        self._mark_seen(node)
+        return self._take_commands(node_id)
+
+    def check_liveness(self) -> list[str]:
+        """Marks silent DataNodes dead and returns the ones that just died.
+
+        Does nothing during the grace period after a failover, so a new leader
+        does not declare the whole cluster dead before the DataNodes have had a
+        chance to report (``API.md`` Section 9).
+        """
+        now = self.clock.monotonic()
+        if now < self._grace_until:
+            return []
+        died: list[str] = []
+        for node in list(self.cluster.datanodes.values()):
+            if node.is_alive and now - node.last_seen_monotonic > self.settings.dead_node_timeout_s:
+                node.is_alive = False
+                died.append(node.node_id)
+                logger.warning("DataNode %s is dead (no heartbeat)", node.node_id)
+        return died
+
+    def begin_failover_grace(self) -> None:
+        """Starts the grace period a new leader waits before declaring anyone dead."""
+        self._grace_until = self.clock.monotonic() + self.settings.failover_grace_s
+
+    # ---- helpers ---------------------------------------------------------
+
+    def _mark_seen(self, node: DataNodeInfo) -> None:
+        """Records a sign of life. Revives a node that had been declared dead."""
+        node.last_heartbeat = self.clock.time()
+        node.last_seen_monotonic = self.clock.monotonic()
+        node.is_alive = True
+
+    def _known(self, node_id: str) -> DataNodeInfo:
+        node = self.cluster.datanodes.get(node_id)
+        if node is None:
+            raise DfshaError(ErrorCode.NODE_NOT_REGISTERED, f"{node_id} is not registered")
+        return node
+
+    def _live_nodes(self) -> list[DataNodeInfo]:
+        return [n for n in self.cluster.datanodes.values() if n.is_alive]
+
+    def _enqueue(self, node_id: str, command: Command) -> None:
+        """Queues a command for the node's next heartbeat, dropping exact duplicates."""
+        queue = self.cluster.pending_commands.setdefault(node_id, [])
+        for queued in queue:
+            if (queued.cmd, queued.block_id, queued.targets) == (
+                command.cmd, command.block_id, command.targets,
+            ):
+                return
+        queue.append(command)
+
+    def _take_commands(self, node_id: str) -> list[Command]:
+        return self.cluster.pending_commands.pop(node_id, [])
+
+    # ---- uploads ---------------------------------------------------------
 
     def prepare_file_upload(
-        self, path: str, size_bytes: int, owner: str = "default_user"
-    ) -> FileMetadata:
+        self, path: str, size_bytes: int, owner: str, overwrite: bool = False
+    ) -> UploadPlan:
+        """Step 1 of ``put`` (``ARCHITECTURE.md`` Section 4.3).
+
+        Validates, reserves the path as a `PENDING` file, splits it into blocks
+        and chooses a pipeline for **each** block. The pipeline is a plan: nothing
+        counts as a replica until a DataNode confirms it.
         """
-        Step 1 of saving a file:
-        Validates, calculates blocks, selects DataNode pipelines, and creates a PENDING file.
-        """
-        if path in self._store.files_by_path:  # verifica si la ruta ya esta registrada
-            existing = self._store.files_by_path[path]
-            if existing.status == FileStatus.COMMITTED:  # si ya esta confirmado no permite duplicados
-                raise ValueError(f"El archivo {path} ya existe en el sistema.")
-
-        # calcula bloques: ceil redondea hacia arriba para no perder el residuo (ej. 10mb / 4mb = 2.5 -> 3 bloques), y max(1, ...) asegura minimo 1 bloque si el archivo esta vacio (0 bytes)
-        num_blocks = max(1, math.ceil(size_bytes / self.block_size))
-        file_id = f"file_{uuid.uuid4().hex[:12]}"  # genera id unico para el archivo
-        blocks: list[BlockMetadata] = []
-
-        live_nodes = [dn for dn in self._store.datanodes.values() if dn.is_alive]  # filtra solo datanodes vivos
-        sorted_nodes = sorted(live_nodes, key=lambda dn: dn.free_bytes, reverse=True)  # ordena por mas espacio libre
-        pipeline_targets = [dn.node_id for dn in sorted_nodes[: self.replication_factor]]  # elige los n mejores nodos
-
-        remaining = size_bytes  # bytes pendientes por asignar a bloques
-        for idx in range(num_blocks):
-            blk_size = min(self.block_size, remaining)  # tamaño de este bloque, evalua si lo que queda por guardar se puede guardar en un bloque, por eso min
-            block_id = f"blk_{uuid.uuid4().hex[:12]}_{idx:04d}"  # genera id unico para el bloque
-            block = BlockMetadata(
-                block_id=block_id,
-                index=idx,  # posicion del bloque para rearmar el archivo en orden
-                size_bytes=blk_size,  # tamaño real de este bloque en bytes
-                replicas=list(pipeline_targets),  # datanodes asignados para guardar este bloque
+        s = self.settings
+        segments = split_path(path)
+        if not segments:
+            raise DfshaError(ErrorCode.IS_A_DIRECTORY, "/ is a directory")
+        path = join_path(segments)
+        if isinstance(size_bytes, bool) or not isinstance(size_bytes, int) or size_bytes < 0:
+            raise DfshaError(ErrorCode.BAD_REQUEST, "size must be a non-negative integer")
+        if size_bytes > s.max_file_size_bytes:
+            raise DfshaError(
+                ErrorCode.FILE_TOO_LARGE,
+                f"{size_bytes} bytes exceeds the limit of {s.max_file_size_bytes}",
             )
-            blocks.append(block)
-            self._store.blocks_by_id[block_id] = block  # indexa el bloque globalmente en memoria
-            remaining -= blk_size  # descuenta los bytes ya procesados
+        if not owner:
+            raise DfshaError(ErrorCode.BAD_REQUEST, "an upload needs an owner")
+        self.store.resolve_dir(join_path(segments[:-1]))  # DIR_NOT_FOUND / NOT_A_DIRECTORY
 
-        file_meta = FileMetadata(
+        now = self.clock.time()
+        pending = self.store.get_pending(path)
+        if pending is not None:
+            if pending.expires_at is not None and pending.expires_at > now:
+                raise DfshaError(ErrorCode.UPLOAD_IN_PROGRESS, f"{path} has an upload in progress")
+            self._abort(pending, now)  # the previous upload expired: reclaim the path now
+
+        existing = self.store.stat(path)
+        if isinstance(existing, DirectoryMetadata):
+            raise DfshaError(ErrorCode.IS_A_DIRECTORY, f"{path} is a directory")
+        if existing is not None and not overwrite:
+            raise DfshaError(ErrorCode.ALREADY_EXISTS, f"{path} already exists")
+
+        live = self._live_nodes()
+        if len(live) < s.replication_factor:
+            raise DfshaError(
+                ErrorCode.NOT_ENOUGH_DATANODES,
+                f"need {s.replication_factor} live DataNodes, have {len(live)}",
+            )
+
+        file_id, blocks = self._new_blocks(size_bytes)
+        pipelines = self._place(blocks, live)  # raises before anything is reserved
+        file = FileMetadata(
             file_id=file_id,
-            path=path,
-            size_bytes=size_bytes,
+            name=segments[-1],
             owner=owner,
-            status=FileStatus.PENDING,  # estado inicial pendiente hasta que el cliente haga commit
-            blocks=blocks,  # lista con los metadatos de cada bloque
+            size_bytes=size_bytes,
+            block_size=s.block_size,
+            replication=s.replication_factor,
+            status=FileStatus.PENDING,
+            created_at=now,
+            modified_at=now,
+            expires_at=now + s.upload_ttl_s,
+            blocks=blocks,
         )
+        self.store.create_pending_file(path, file)
 
-        self._store.files_by_id[file_id] = file_meta  # indexa el archivo por su id unico
-        self._store.files_by_path[path] = file_meta  # indexa el archivo por su ruta canonica
-        return file_meta  # retorna el plan de bloques y nodos para que el cliente empiece a subir
+        planned: list[PlannedBlock] = []
+        for block, chosen in zip(blocks, pipelines, strict=True):
+            self.cluster.pipelines[block.block_id] = [n.node_id for n in chosen]
+            for node in chosen:
+                self._reserve(block.block_id, node.node_id, block.size_bytes)
+            token = mint(
+                block.block_id, BlockOp.WRITE, owner, s.block_token_secret, s.token_ttl_s, now=now
+            )
+            planned.append(PlannedBlock(block=block, pipeline=chosen, token=token))
+        return UploadPlan(file=file, path=path, blocks=planned)
 
     def commit_file_upload(
-        self, file_id: str, block_checksums: Optional[dict[str, str]] = None
+        self,
+        file_id: str,
+        blocks: list[CommittedBlock],
+        file_checksum: str | None = None,
     ) -> FileMetadata:
+        """Step 3 of ``put`` (``ARCHITECTURE.md`` Section 4.3, ``API.md`` Section 5.2).
+
+        Accepted only if every block is listed with the right size and every block
+        has at least ``MIN_REPLICAS_COMMIT`` replicas **confirmed by DataNodes** on
+        live nodes whose checksum equals the client's. That is the write quorum, and
+        it is checked against confirmations, never against the planned pipeline.
         """
-        Step 3 of saving a file:
-        Called when client finishes writing blocks to DataNodes. Marks file as COMMITTED.
+        s = self.settings
+        file = self.store.get_file_by_id(file_id)
+        if file is None:
+            raise DfshaError(ErrorCode.FILE_NOT_FOUND, f"no upload with id {file_id}")
+        now = self.clock.time()
+
+        if file.status is FileStatus.COMMITTED:
+            if self._same_body(file, blocks, file_checksum):
+                return file  # a retried commit is a success, not an error
+            raise DfshaError(ErrorCode.ALREADY_EXISTS, "file already committed with other contents")
+        if file.status is FileStatus.ABORTED:
+            raise DfshaError(ErrorCode.FILE_NOT_FOUND, "the upload was aborted or expired")
+        if file.expires_at is not None and file.expires_at <= now:
+            self._abort(file, now)
+            raise DfshaError(ErrorCode.FILE_NOT_FOUND, "the upload expired")
+
+        reported = self._validate_report(file, blocks, file_checksum)
+
+        live = {n.node_id for n in self._live_nodes()}
+        corrupt: dict[str, list[str]] = {}
+        for block in file.blocks:
+            claimed = reported[block.index].checksum
+            checksums = self.cluster.replica_checksums.get(block.block_id, {})
+            holders = sorted(self.cluster.replicas.get(block.block_id, set()) & live)
+            good = [nid for nid in holders if checksums.get(nid) == claimed]
+            if len(good) < s.min_replicas_commit:
+                if len(holders) > len(good):
+                    raise DfshaError(
+                        ErrorCode.CHECKSUM_MISMATCH,
+                        f"block {block.index}: a DataNode stored different bytes than the client sent",
+                    )
+                raise DfshaError(
+                    ErrorCode.INSUFFICIENT_REPLICAS,
+                    f"block {block.index} has {len(good)} confirmed replicas, "
+                    f"{s.min_replicas_commit} required",
+                )
+            corrupt[block.block_id] = [nid for nid in holders if nid not in good]
+
+        # the quorum holds: commit as one step
+        for block in file.blocks:
+            block.checksum = reported[block.index].checksum
+        file.checksum = file_checksum
+        replaced = self.store.commit_file(file_id, now)
+
+        for block in file.blocks:
+            self._release_block_reservations(block.block_id)  # unconfirmed hops never arrived
+            self.cluster.pipelines.pop(block.block_id, None)
+            for nid in corrupt[block.block_id]:  # a copy that disagrees is not a replica
+                self._discard_replica(nid, block.block_id)
+                self._enqueue(nid, Command("delete", block.block_id))
+        if replaced is not None:
+            self._schedule_deletion(replaced.blocks)
+        return file
+
+    def abort_file_upload(self, file_id: str) -> None:
+        """Cancels a pending upload. Idempotent (``API.md`` Section 5.6)."""
+        file = self.store.get_file_by_id(file_id)
+        if file is None or file.status is FileStatus.ABORTED:
+            return
+        if file.status is FileStatus.COMMITTED:
+            raise DfshaError(ErrorCode.BAD_REQUEST, "the file is already committed; remove it instead")
+        self._abort(file, self.clock.time())
+
+    def record_block_received(
+        self, node_id: str, block_id: str, size: int, checksum: str
+    ) -> None:
+        """A DataNode confirms it stored a block (``API.md`` Section 7).
+
+        This is what turns an allocated pipeline slot into a replica. A block
+        nobody asked for, or one that is the wrong size, is told to delete itself.
         """
-        if file_id not in self._store.files_by_id:  # valida que la reserva del archivo exista
-            raise KeyError(f"File {file_id} not found.")
+        self._known(node_id)
+        block = self.store.get_block(block_id)
+        file = self.store.file_of_block(block_id)
+        if block is None or file is None or file.status is FileStatus.ABORTED:
+            self._enqueue(node_id, Command("delete", block_id))  # an orphan
+            return
+        if size != block.size_bytes:
+            logger.warning("%s stored %s with %d bytes, expected %d", node_id, block_id, size, block.size_bytes)
+            self._enqueue(node_id, Command("delete", block_id))
+            return
+        self._confirm_replica(node_id, block, checksum)
 
-        file_meta = self._store.files_by_id[file_id]  # obtiene los metadatos del archivo pendiente
-        if file_meta.status != FileStatus.PENDING:  # solo permite confirmar si esta en estado pendiente
-            raise ValueError(f"File {file_id} is not in PENDING state.")
+    # ---- upload internals ------------------------------------------------
 
-        if block_checksums:  # si el cliente calculo y envio los hashes sha-256 de los bloques
-            for blk in file_meta.blocks:  # recorre cada bloque del archivo
-                if blk.block_id in block_checksums:  # busca el hash correspondiente a este bloque
-                    blk.checksum = block_checksums[blk.block_id]  # asocia el hash al bloque para verificar integridad futura
+    def _new_blocks(self, size_bytes: int) -> tuple[str, list[BlockMetadata]]:
+        """A fresh file id and its blocks. Ids are re-drawn on the (remote) chance of a clash."""
+        count = self.settings.blocks_for(size_bytes)
+        while True:
+            file_id = str(uuid.uuid4())
+            short = file_id.replace("-", "")[:8]
+            ids = [f"blk_{short}_{i:06d}" for i in range(count)]
+            if self.store.get_file_by_id(file_id) is None and all(
+                self.store.get_block(b) is None for b in ids
+            ):
+                break
+        blocks: list[BlockMetadata] = []
+        remaining = size_bytes
+        for index, block_id in enumerate(ids):
+            size = min(self.settings.block_size, remaining)
+            blocks.append(BlockMetadata(block_id=block_id, index=index, size_bytes=size))
+            remaining -= size
+        return file_id, blocks
 
-        file_meta.status = FileStatus.COMMITTED  # cambia a committed haciendo el archivo visible y disponible
-        return file_meta  # retorna los metadatos finales del archivo ya confirmado
+    def _place(self, blocks: list[BlockMetadata], live: list[DataNodeInfo]) -> list[list[DataNodeInfo]]:
+        """A pipeline per block, accounting for space the earlier blocks will take.
 
-    def register_datanode(self, node_id: str, address: str, capacity_bytes: int) -> DataNodeInfo:
-        """Registers or updates a DataNode in the cluster."""
-        node = DataNodeInfo(node_id=node_id, address=address, capacity_bytes=capacity_bytes)  # crea la ficha del datanode con su ip y capacidad
-        self._store.datanodes[node_id] = node  # guarda el datanode en el registro del namenode para tenerlo disponible
-        return node  # retorna la informacion del nodo registrado
+        Works on a scratch copy of the reservations, so if a later block cannot be
+        placed nothing has been reserved and there is nothing to roll back.
+        """
+        scratch = dict(self.cluster.reserved_bytes)
+        result: list[list[DataNodeInfo]] = []
+        for block in blocks:
+            chosen = placement.choose_pipeline(
+                live, scratch, block.size_bytes, self.settings.replication_factor, self.rng
+            )
+            for node in chosen:
+                scratch[node.node_id] = scratch.get(node.node_id, 0) + block.size_bytes
+            result.append(chosen)
+        return result
 
-    def record_heartbeat(self, node_id: str) -> list[dict]:
-        """Updates last_heartbeat and returns pending commands for this DataNode."""
-        if node_id in self._store.datanodes:
-            self._store.datanodes[node_id].last_heartbeat = asyncio.get_event_loop().time()
-            self._store.datanodes[node_id].is_alive = True
+    def _validate_report(
+        self, file: FileMetadata, blocks: list[CommittedBlock], file_checksum: str | None
+    ) -> dict[int, CommittedBlock]:
+        """Checks the shape of a commit body and returns it indexed by block index."""
+        by_index: dict[int, CommittedBlock] = {}
+        for item in blocks:
+            if item.index in by_index:
+                raise DfshaError(ErrorCode.BAD_REQUEST, f"block {item.index} is listed twice")
+            by_index[item.index] = item
+        if set(by_index) != set(range(len(file.blocks))):
+            raise DfshaError(
+                ErrorCode.BAD_REQUEST, f"all {len(file.blocks)} blocks must be listed exactly once"
+            )
+        total = 0
+        for block in file.blocks:
+            item = by_index[block.index]
+            if item.block_id != block.block_id:
+                raise DfshaError(ErrorCode.BAD_REQUEST, f"block {block.index} has the wrong block_id")
+            if item.size != block.size_bytes:
+                raise DfshaError(
+                    ErrorCode.BAD_REQUEST,
+                    f"block {block.index} is {item.size} bytes, expected {block.size_bytes}",
+                )
+            if not _SHA256.fullmatch(item.checksum):
+                raise DfshaError(ErrorCode.BAD_REQUEST, f"block {block.index} checksum is not SHA-256 hex")
+            total += item.size
+        if total != file.size_bytes:
+            raise DfshaError(ErrorCode.BAD_REQUEST, "block sizes do not add up to the declared size")
+        if file_checksum is not None and not _SHA256.fullmatch(file_checksum):
+            raise DfshaError(ErrorCode.BAD_REQUEST, "file_checksum is not SHA-256 hex")
+        return by_index
 
-        # Retornar comandos pendientes para este nodo (ej. replicar bloque)
-        commands = [cmd for cmd in self.pending_replications if cmd.get("source") == node_id]
-        # Remover comandos despachados
-        self.pending_replications = [cmd for cmd in self.pending_replications if cmd not in commands]
-        return commands
+    @staticmethod
+    def _same_body(file: FileMetadata, blocks: list[CommittedBlock], file_checksum: str | None) -> bool:
+        """Whether a retried commit describes the file as it was committed."""
+        by_index = {b.index: b for b in blocks}
+        if len(blocks) != len(file.blocks) or len(by_index) != len(blocks):
+            return False
+        for block in file.blocks:
+            item = by_index.get(block.index)
+            if item is None or item.block_id != block.block_id or item.checksum != block.checksum:
+                return False
+        return file_checksum is None or file_checksum == file.checksum
 
+    def _abort(self, file: FileMetadata, now: float) -> None:
+        """`PENDING` to `ABORTED`, freeing the path and telling holders to delete."""
+        self.store.abort_file(file.file_id, now)
+        self._schedule_deletion(file.blocks)
+
+    def _confirm_replica(self, node_id: str, block: BlockMetadata, checksum: str) -> None:
+        """Records a confirmed copy and releases the space that was held for it."""
+        self.cluster.replicas.setdefault(block.block_id, set()).add(node_id)
+        self.cluster.replica_checksums.setdefault(block.block_id, {})[node_id] = checksum
+        self._release_reservation(block.block_id, node_id)
+        flight = self.cluster.in_flight_replications.get(block.block_id)
+        if flight is not None:
+            flight.pop(node_id, None)
+            if not flight:
+                del self.cluster.in_flight_replications[block.block_id]
+
+    def _schedule_deletion(self, blocks: list[BlockMetadata]) -> None:
+        """Forgets blocks and tells every node that may hold them to delete them.
+
+        Nodes that are down are asked too; they receive the command when they
+        return. Anything that still slips through is an orphan, which the next
+        block report removes.
+        """
+        for block in blocks:
+            block_id = block.block_id
+            holders = set(self.cluster.replicas.pop(block_id, ()))
+            holders |= set(self.cluster.pipelines.pop(block_id, ()))
+            holders |= set(self.cluster.in_flight_replications.pop(block_id, {}))
+            holders |= set(self.cluster.reservations.get(block_id, {}))
+            self._release_block_reservations(block_id)
+            self.cluster.replica_checksums.pop(block_id, None)
+            for node_id in sorted(holders):
+                if node_id in self.cluster.datanodes:
+                    self._enqueue(node_id, Command("delete", block_id))
+
+    def _reserve(self, block_id: str, node_id: str, nbytes: int) -> None:
+        """Claims ``nbytes`` on a node for a block, once per (block, node)."""
+        held = self.cluster.reservations.setdefault(block_id, {})
+        if node_id in held:
+            return
+        held[node_id] = nbytes
+        self.cluster.reserved_bytes[node_id] = self.cluster.reserved_bytes.get(node_id, 0) + nbytes
+
+    def _release_reservation(self, block_id: str, node_id: str) -> None:
+        """Gives back what ``_reserve`` claimed. Safe to call twice: the second is a no-op."""
+        held = self.cluster.reservations.get(block_id)
+        if held is None or node_id not in held:
+            return
+        nbytes = held.pop(node_id)
+        if not held:
+            del self.cluster.reservations[block_id]
+        remaining = self.cluster.reserved_bytes.get(node_id, 0) - nbytes
+        if remaining > 0:
+            self.cluster.reserved_bytes[node_id] = remaining
+        else:
+            self.cluster.reserved_bytes.pop(node_id, None)
+
+    def _release_block_reservations(self, block_id: str) -> None:
+        for node_id in list(self.cluster.reservations.get(block_id, {})):
+            self._release_reservation(block_id, node_id)
+
+    # ---- reading ---------------------------------------------------------
+
+    def get_file_blocks(self, path: str, user: str) -> FileLocation:
+        """Step 1 of ``get`` (``API.md`` Section 5.3): the block map of a committed file.
+
+        Only **live** replicas are listed, in random order so that readers spread
+        over the replicas instead of all hitting the first one. A pending upload
+        is invisible here, so a reader sees the complete old version or the
+        complete new one, never a mix.
+        """
+        if not user:
+            raise DfshaError(ErrorCode.BAD_REQUEST, "a read needs a user")
+        canonical = join_path(split_path(path))
+        node = self.store.stat(canonical)
+        if node is None:
+            raise DfshaError(ErrorCode.FILE_NOT_FOUND, f"{canonical} does not exist")
+        if isinstance(node, DirectoryMetadata):
+            raise DfshaError(ErrorCode.IS_A_DIRECTORY, f"{canonical} is a directory")
+
+        now = self.clock.time()
+        located: list[BlockLocation] = []
+        for block in node.blocks:
+            replicas = [self.cluster.datanodes[nid] for nid in self._live_holders(block.block_id)]
+            self.rng.shuffle(replicas)
+            token = mint(
+                block.block_id, BlockOp.READ, user,
+                self.settings.block_token_secret, self.settings.token_ttl_s, now=now,
+            )
+            located.append(BlockLocation(block=block, token=token, replicas=replicas))
+        return FileLocation(file=node, path=canonical, blocks=located)
+
+    # ---- file system operations (RF1) -------------------------------------
+
+    def mkdir(self, path: str, owner: str, parents: bool = False) -> DirectoryMetadata:
+        if not owner:
+            raise DfshaError(ErrorCode.BAD_REQUEST, "a directory needs an owner")
+        return self.store.mkdir(path, owner, self.clock.time(), parents=parents)
+
+    def ls(self, path: str) -> list[DirEntry]:
+        return self.store.list_dir(path)
+
+    def stat(self, path: str) -> DirectoryMetadata | FileMetadata:
+        node = self.store.stat(path)
+        if node is None:
+            raise DfshaError(ErrorCode.FILE_NOT_FOUND, f"{join_path(split_path(path))} does not exist")
+        return node
+
+    def rm(self, path: str) -> FileMetadata:
+        """Removes a file. It vanishes from ``ls`` at once; its blocks are deleted
+        afterwards through ``delete`` commands (``API.md`` Section 4.3)."""
+        file = self.store.remove_file(path, self.clock.time())
+        self._schedule_deletion(file.blocks)
+        return file
+
+    def rmdir(self, path: str, recursive: bool = False) -> int:
+        """Removes a directory and returns how many files went with it."""
+        removed = self.store.remove_dir(path, recursive, self.clock.time())
+        for file in removed:
+            self._schedule_deletion(file.blocks)
+        return len(removed)
+
+    def _live_holders(self, block_id: str) -> list[str]:
+        """Ids of live nodes that have confirmed a copy of the block, sorted."""
+        holders = self.cluster.replicas.get(block_id, set())
+        return sorted(
+            nid for nid in holders
+            if (node := self.cluster.datanodes.get(nid)) is not None and node.is_alive
+        )
+
+    # ---- block reports -----------------------------------------------------
+
+    def process_block_report(self, node_id: str, blocks: list[ReportedBlock]) -> list[Command]:
+        """Reconciles a DataNode's full inventory with the metadata (``API.md`` Section 7).
+
+        This is how replica locations are rebuilt after a failover, since they are
+        soft state. It also finds orphans (blocks nobody owns, or that belong to an
+        aborted upload) and damaged copies, and notices blocks the node used to hold
+        and no longer reports. Returns the node's pending commands.
+        """
+        self._known(node_id)
+        reported: set[str] = set()
+        for item in blocks:
+            reported.add(item.block_id)
+            block = self.store.get_block(item.block_id)
+            file = self.store.file_of_block(item.block_id)
+            if block is None or file is None or file.status is FileStatus.ABORTED:
+                self._enqueue(node_id, Command("delete", item.block_id))  # an orphan
+                continue
+            damaged = item.size != block.size_bytes or (
+                block.checksum is not None and item.checksum != block.checksum
+            )
+            if damaged:
+                self._discard_replica(node_id, item.block_id)
+                self._enqueue(node_id, Command("delete", item.block_id))
+                continue
+            self._confirm_replica(node_id, block, item.checksum)
+
+        # blocks this node was believed to hold but did not report are gone
+        for block_id, holders in list(self.cluster.replicas.items()):
+            if node_id in holders and block_id not in reported:
+                self._discard_replica(node_id, block_id)
+        return self._take_commands(node_id)
+
+    def record_block_corrupt(self, node_id: str, block_id: str) -> None:
+        """A DataNode found a damaged block and deleted it (``API.md`` Section 7).
+
+        The replica stops counting; the next replication scan notices the deficit
+        and schedules a fresh copy.
+        """
+        self._known(node_id)
+        self._discard_replica(node_id, block_id)
+
+    def _discard_replica(self, node_id: str, block_id: str) -> None:
+        """Stops counting ``node_id`` as a holder of ``block_id``."""
+        holders = self.cluster.replicas.get(block_id)
+        if holders is not None:
+            holders.discard(node_id)
+            if not holders:
+                del self.cluster.replicas[block_id]
+        checksums = self.cluster.replica_checksums.get(block_id)
+        if checksums is not None:
+            checksums.pop(node_id, None)
+            if not checksums:
+                del self.cluster.replica_checksums[block_id]
+
+    # ---- re-replication ----------------------------------------------------
+
+    def scan_replication(self) -> ReplicationScan:
+        """Restores the target replica count (``ARCHITECTURE.md`` Section 6.6).
+
+        * Only blocks of `COMMITTED` files are examined. A `PENDING` upload is
+          legitimately short of replicas while it is being written.
+        * The most endangered blocks go first: one with a single live replica
+          before one with two.
+        * The ``replicate`` command goes to a node that already holds the block (the
+          **source**); the NameNode never moves bytes itself.
+        * A copy already in flight is not scheduled twice, but gives up after
+          ``IN_FLIGHT_TIMEOUT_S`` so a lost command cannot block a repair forever.
+        * Surplus replicas, for example when a dead node comes back after its blocks
+          were re-created elsewhere, are ordered deleted from the fullest nodes.
+        """
+        mono = self.clock.monotonic()
+        self._expire_in_flight(mono)
+        live = self._live_nodes()
+
+        deficits: list[tuple[int, str, int, FileMetadata, BlockMetadata, list[str]]] = []
+        deleted = 0
+        for file in self.store.files(FileStatus.COMMITTED):
+            for block in file.blocks:
+                holders = self._live_holders(block.block_id)
+                if len(holders) > file.replication:
+                    deleted += self._trim_surplus(block, file.replication, holders)
+                elif len(holders) < file.replication:
+                    deficits.append((len(holders), file.file_id, block.index, file, block, holders))
+        deficits.sort(key=lambda d: d[:3])  # fewest live replicas first, then deterministic
+
+        scheduled = unrecoverable = 0
+        reserved = self.cluster.reserved_bytes
+        for live_count, _, _, file, block, holders in deficits:
+            if live_count == 0:
+                unrecoverable += 1  # nothing left to copy from
+                continue
+            block_id = block.block_id
+            in_flight = self.cluster.in_flight_replications.get(block_id, {})
+            needed = file.replication - live_count - len(in_flight)
+            if needed <= 0:
+                continue
+            exclude = set(self.cluster.replicas.get(block_id, ())) | set(in_flight)
+            eligible = placement.eligible_nodes(live, reserved, block.size_bytes, exclude)
+            targets = placement.weighted_sample(eligible, needed, self.rng, reserved)
+            if not targets:
+                continue  # no node can take it yet; try again next scan
+            source = self.rng.choice(holders)
+            token = mint(
+                block_id, BlockOp.WRITE, SYSTEM_PRINCIPAL,
+                self.settings.block_token_secret, self.settings.token_ttl_s, now=self.clock.time(),
+            )
+            self._enqueue(source, Command("replicate", block_id, [t.node_id for t in targets], token))
+            for target in targets:
+                self.cluster.in_flight_replications.setdefault(block_id, {})[target.node_id] = mono
+                self._reserve(block_id, target.node_id, block.size_bytes)
+            scheduled += 1
+
+        return ReplicationScan(
+            under_replicated=len(deficits),
+            unrecoverable=unrecoverable,
+            scheduled=scheduled,
+            deleted=deleted,
+        )
+
+    def _trim_surplus(self, block: BlockMetadata, keep: int, holders: list[str]) -> int:
+        """Orders the fullest nodes to drop copies until ``keep`` remain."""
+        surplus = len(holders) - keep
+        fullest_first = sorted(
+            holders, key=lambda nid: (self.cluster.datanodes[nid].free_bytes(), nid)
+        )
+        for node_id in fullest_first[:surplus]:
+            self._discard_replica(node_id, block.block_id)
+            self._enqueue(node_id, Command("delete", block.block_id))
+        return surplus
+
+    def _expire_in_flight(self, mono: float) -> None:
+        """Drops copies that timed out or whose target died, releasing their space."""
+        for block_id, targets in list(self.cluster.in_flight_replications.items()):
+            for node_id, started in list(targets.items()):
+                node = self.cluster.datanodes.get(node_id)
+                if node is None or not node.is_alive or mono - started > IN_FLIGHT_TIMEOUT_S:
+                    del targets[node_id]
+                    self._release_reservation(block_id, node_id)
+            if not targets:
+                del self.cluster.in_flight_replications[block_id]
+
+    # ---- garbage collection ------------------------------------------------
+
+    def collect_garbage(self) -> GcResult:
+        """Expires stale uploads and forgets old aborted records (``ARCHITECTURE.md`` Section 4.2).
+
+        A `PENDING` upload past its ``expires_at`` becomes `ABORTED`: its path is
+        freed, its reserved space released, and every node that may hold a piece is
+        told to delete it (test plan T18). The `ABORTED` record is kept for one more
+        ``UPLOAD_TTL_S`` so a late commit or block report can still be recognised
+        instead of looking like an unknown id, and is then purged.
+        """
+        now = self.clock.time()
+        expired = [
+            f for f in self.store.files(FileStatus.PENDING)
+            if f.expires_at is not None and f.expires_at <= now
+        ]
+        for file in expired:
+            self._abort(file, now)
+        purged = self.store.purge_aborted(older_than=now - self.settings.upload_ttl_s)
+        return GcResult(expired=len(expired), purged=len(purged))
+
+    # ---- observability -----------------------------------------------------
+
+    def stats(self) -> ClusterStats:
+        """Cluster totals, including the under-replicated count the demos watch."""
+        committed = self.store.files(FileStatus.COMMITTED)
+        under = sum(
+            1
+            for file in committed
+            for block in file.blocks
+            if len(self._live_holders(block.block_id)) < file.replication
+        )
+        nodes = list(self.cluster.datanodes.values())
+        return ClusterStats(
+            files=len(committed),
+            blocks=sum(len(f.blocks) for f in committed),
+            under_replicated_blocks=under,
+            live_nodes=sum(1 for n in nodes if n.is_alive),
+            dead_nodes=sum(1 for n in nodes if not n.is_alive),
+            bytes_stored=sum(f.size_bytes for f in committed),
+            term=self.term,
+        )
+
+    # ---- background tasks --------------------------------------------------
+
+    async def run(self) -> None:
+        """Runs the REST server and the background tasks until cancelled."""
+        await asyncio.gather(
+            self.api_server(),
+            self.monitor_datanodes(),
+            self.monitor_replication(),
+            self.garbage_collector(),
+        )
+
+    async def api_server(self) -> None:
+        """Serves the REST API. The NameNode speaks REST only, never gRPC.
+
+        The FastAPI layer is the next build step (``ARCHITECTURE.md`` Section 5.2),
+        so for now this just keeps the process alive next to the other tasks.
+        """
+        await asyncio.Event().wait()
+
+    async def monitor_datanodes(self) -> None:
+        await self._every(LIVENESS_PERIOD_S, self.check_liveness)
+
+    async def monitor_replication(self) -> None:
+        await self._every(REPLICATION_PERIOD_S, self.scan_replication)
+
+    async def garbage_collector(self) -> None:
+        await self._every(GC_PERIOD_S, self.collect_garbage)
+
+    async def _every(self, period_s: float, task: Callable[[], object]) -> None:
+        """Calls ``task`` forever, ``period_s`` apart.
+
+        A failure is logged and the loop carries on. These tasks are what notice a
+        dead DataNode and repair its blocks, so one bad iteration must never stop them.
+        """
+        while True:
+            try:
+                task()
+            except Exception:  # a background task must outlive any single failure
+                logger.exception("background task %s failed; will retry", getattr(task, "__name__", task))
+            await asyncio.sleep(period_s)

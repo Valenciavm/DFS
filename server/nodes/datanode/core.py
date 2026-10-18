@@ -1,12 +1,14 @@
 """DataNode lifecycle: block server plus the control channel to the NameNode."""
 import os
 import asyncio
+import hashlib
 from typing import Optional
 
 import grpc
 
+from proto import block_service_pb2 as pb2
 from proto import block_service_pb2_grpc as pb2_grpc
-from server.nodes.datanode.block_service import BlockServiceImpl
+from server.nodes.datanode.block_service import BLOCK_CHUNK_SIZE, BlockServiceImpl
 from server.nodes.datanode.storage import StorageManager
 
 # Configuración por defecto del DataNode
@@ -74,15 +76,23 @@ class DataNode:
                 await asyncio.sleep(DEFAULT_HEARTBEAT_INTERVAL)
 
     async def handle_commands(self, commands: list[dict]):
-        """Ejecuta órdenes devueltas por el NameNode (ej. replicar bloque o borrar)."""
+        """Ejecuta las órdenes que el NameNode devuelve en el heartbeat.
+
+        Shape of each command: API.md section 7 (``cmd``, ``block_id``,
+        ``targets`` with ``internal_addr``, ``token``).
+        """
         for cmd in commands:
-            action = cmd.get("action")
+            action = cmd.get("cmd")  # "replicate" | "delete"
             block_id = cmd.get("block_id")
-            if action == "replicate":  # orden de transferir copia a otro datanode
-                target_addr = cmd.get("target_address")
-                await self.replicate_block_to_node(block_id, target_addr)
+            if action == "replicate":  # orden de transferir copia a otros datanodes
+                for target in cmd.get("targets", []):  # un bloque puede ir a varios destinos
+                    await self.replicate_block_to_node(
+                        block_id, target.get("internal_addr"), token=cmd.get("token")
+                    )
             elif action == "delete":  # orden del recolector de basura
                 self.storage.delete_block(block_id)
+            else:
+                print(f"[DataNode {self.node_id}] Comando desconocido ignorado: {action}")
 
     # -------------------------------------------------------------------------
     # Servidor gRPC de Bloques y Pipeline
@@ -104,8 +114,38 @@ class DataNode:
         )
         await self.grpc_server.wait_for_termination()  # mantiene vivo el servidor
 
-    async def replicate_block_to_node(self, block_id: str, target_address: str):
-        """Envía una copia de un bloque local hacia otro DataNode por gRPC."""
+    async def replicate_block_to_node(
+        self, block_id: str, target_address: str, token: Optional[str] = None
+    ):
+        """Envía una copia de un bloque local hacia otro DataNode por gRPC.
+
+        Esto es el lado cliente de un comando ``replicate``: el NameNode nunca
+        mueve bytes, solo le pide al nodo origen que lo haga.
+        """
         data = self.storage.read_block(block_id)  # lee los bytes del disco local
-        # aqui se conecta por canal gRPC al target_address y llama a WriteBlock
-        print(f"[DataNode {self.node_id}] Replicando {block_id} hacia {target_address}...")
+        checksum = hashlib.sha256(data).hexdigest()  # calcula su hash sha-256
+        size = len(data)  # tamaño en bytes
+
+        print(f"[DataNode {self.node_id}] Replicando {block_id} ({size} bytes) -> {target_address}...")
+
+        # TODO(security): canal TLS y x-block-token con el `token` recibido (API.md 2.1)
+        async with grpc.aio.insecure_channel(target_address) as channel:  # conecta con el otro datanode
+            stub = pb2_grpc.BlockServiceStub(channel)  # crea el stub cliente
+
+            async def generate_requests():
+                # header inicial sin mas nodos en el pipeline: es una copia dirigida
+                yield pb2.WriteBlockRequest(
+                    header=pb2.WriteBlockHeader(
+                        block_id=block_id, size=size, checksum_sha256=checksum, pipeline=[]
+                    )
+                )
+                # chunks del bloque
+                for i in range(0, size, BLOCK_CHUNK_SIZE):
+                    yield pb2.WriteBlockRequest(chunk=data[i : i + BLOCK_CHUNK_SIZE])
+
+            resp = await stub.WriteBlock(generate_requests())  # ejecuta la replicacion remota
+            print(
+                f"[DataNode {self.node_id}] Réplica de {block_id} en {target_address} "
+                f"confirmada: SHA {resp.checksum_sha256[:8]}..."
+            )
+            return resp

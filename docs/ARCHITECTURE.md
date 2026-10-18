@@ -212,7 +212,7 @@ Consequence: PostgreSQL is touched only by metadata operations (`mkdir`, `put`, 
 
 ### 5.2 High availability from the start
 
-There is no interim single-NameNode version: from the first integration there are **two NameNodes sharing one PostgreSQL database**, with leader election by lease. High availability and replication/consistency weigh 30% of the grade, and retrofitting persistence and failover into a core written for memory would mean rewriting it.
+There is no interim single-NameNode version: from the first integration there are **two NameNodes sharing one replicated PostgreSQL cluster**, with leader election by lease. High availability and replication/consistency weigh 30% of the grade, and retrofitting persistence and failover into a core written for memory would mean rewriting it.
 
 The core talks to the hard state only through the `MetadataStore` interface. The real implementation is backed by PostgreSQL; an in-memory implementation exists **only for unit tests** (fake time, no database). The in-memory dictionaries (`files_by_id`, `files_by_path`, `blocks_by_id`) are the **leader's cache** over the database.
 
@@ -222,11 +222,39 @@ The core talks to the hard state only through the `MetadataStore` interface. The
 - **Takeover:** the new leader loads the hard state from PostgreSQL into memory, waits `FAILOVER_GRACE_S`, and rebuilds the soft state while DataNodes re-register and send block reports (a DataNode that sees a higher `term` sends a block report immediately).
 - **Uploads in flight during a failover:** the file stays `PENDING` in the database; the client retries `commit`, which may answer `INSUFFICIENT_REPLICAS` until the block reports arrive, and the client's `tokens` call returns fresh pipelines for blocks not yet written.
 
+#### The metadata store is replicated too
+
+Two NameNodes in front of a single database would just move the single point of failure one layer down, and the statement asks for a service that is "highly redundant to avoid service outages or loss of files". So the metadata store is replicated as well, with the same code against two deployment profiles:
+
+| Profile | Topology | Failover |
+|---|---|---|
+| Local / demo (`docker-compose`) | PostgreSQL **primary + one streaming replica** in hot standby (readable) | Manual promotion with `pg_promote()`, demonstrated in test T20 |
+| Cloud (AWS Academy) | **Amazon RDS Multi-AZ** | Managed by AWS; the endpoint does not change, so the NameNodes need no code change |
+
+PostgreSQL rather than MySQL: the schema in Section 5.5 is written for it, `psycopg` is the pinned driver, and the lease row relies on a conditional atomic `UPDATE` where its `ON CONFLICT` and `FOR UPDATE` semantics are the clearest. If RDS turns out to be unavailable in the AWS Academy sandbox, the fallback is the same primary + replica pair on two EC2 instances.
+
+Only the primary is ever written. The replica exists for failover, not for load balancing, because reads are already served from the leader's in-memory cache.
+
+#### Degraded mode when the database is unreachable
+
+If the leader cannot renew its lease, the naive reaction is to step down. That would be wrong: with the database down no standby can acquire the lease either, so stepping down leaves nobody serving, and a database outage would become a total outage.
+
+Instead the leader **keeps its leadership and degrades to read-only**:
+
+- **Reads** (`ls`, `stat`, `get`, block maps and read tokens) keep being served from the leader's cache, and are safe because nothing can be changing underneath.
+- **Writes** (`mkdir`, `put`, `commit`, `rm`, ACL changes) fail with `503`.
+- `/v1/ha/status` reports `role: "leader"` with `degraded: true`, so the condition is observable.
+- There is no risk of split brain: a second NameNode cannot take over without the database, and any write that did reach the database would still be fenced by the lease check.
+- The **data plane is unaffected**: once a client holds a block map it talks only to DataNodes, so reads and in-flight uploads keep moving at full speed.
+
+So a metadata database outage costs the ability to change metadata, not the ability to read files.
+
 **Suggested build order**, so the Client and the DataNodes can integrate before everything is finished:
 1. Schema and the PostgreSQL-backed `MetadataStore`, plus the in-memory fake for tests.
 2. NameNode core (Section 4.3) with unit tests using fake time.
 3. REST layer, running **one** NameNode against PostgreSQL: the Client and the DataNodes integrate from here.
 4. Lease, `term` fencing and the second NameNode; failover tests T5, T16 and T17.
+5. Streaming replica, degraded mode and promotion; test T20.
 
 ### 5.3 Model
 
@@ -398,7 +426,8 @@ The pipeline is only the plan. A node counts as a replica of a block when it con
 | Leader dies during a `put` | The file stays `PENDING` in the database; the client retries `commit` (it may need a few seconds until block reports rebuild the replica locations) |
 | Zombie (stale) leader | DataNodes ignore commands with a lower `term`; its database writes are rejected by the lease check (fencing) |
 | A NameNode process restarts | It reloads the hard state from PostgreSQL and rebuilds the soft state from heartbeats and block reports |
-| PostgreSQL unavailable | Metadata operations fail with `503`; reads served from the cache keep working; **stated limitation**, mitigated by a replica (stretch goal) |
+| PostgreSQL primary unavailable | The leader keeps leadership and degrades to **read-only**: reads served from its cache, writes `503`, `degraded: true` in `/v1/ha/status`. The data plane is unaffected. Recovery is promotion of the streaming replica, or automatic in RDS Multi-AZ (Section 5.2) |
+| Both database nodes unavailable | Same degraded read-only mode, which is the strongest guarantee available without hard state. Stated as a limitation |
 
 ---
 
@@ -436,14 +465,17 @@ The pipeline is only the plan. A node counts as a replica of a block when it con
 ## 10. Execution environment
 
 - Every node runs **natively or in Docker**; each exposes an API (statement requirement).
-- **Local cluster:** `docker-compose.yml` with `postgres`, `namenode1`, `namenode2`, `datanode1..3` and a `client` container (optionally `datanode4` to show scaling). Demo profile: `BLOCK_SIZE=1MB`. A single NameNode can run against the same PostgreSQL while the second one is not ready yet.
+- **Local cluster:** `docker-compose.yml` with `postgres-primary`, `postgres-replica`, `namenode1`, `namenode2`, **`datanode1..5`** and a `client` container. Demo profile: `BLOCK_SIZE=1MB`. A single NameNode can run against the same database while the second one is not ready yet.
 - **Cloud (AWS Academy / GCP academic), suggested topology:**
 
 | VM | Runs | Ports |
 |---|---|---|
-| vm1 | NameNode 1 + PostgreSQL | 8000 (REST: clients and DataNodes), 5432 (**only from NameNodes**) |
+| vm1 | NameNode 1 | 8000 (REST: clients and DataNodes) |
 | vm2 | NameNode 2 | 8000 (REST) |
-| vm3, vm4, vm5 | DataNode 1, 2, 3 | 9000 (gRPC: clients and other DataNodes) |
+| vm3 … vm7 | DataNode 1 … 5 | 9000 (gRPC: clients and other DataNodes) |
+| managed | RDS Multi-AZ PostgreSQL | 5432 (**only from the NameNodes' security group**) |
+
+Five DataNodes is a **minimum, not a preference**, and the reason is in Section 6.2: with exactly three nodes and replication factor 3 every block necessarily lands on all three, so partitioning becomes indistinguishable from mirroring and two scenarios of the test plan (T4 and T13) cannot run at all, because re-replication needs a live node that does not already hold the block.
 
 - Configuration through environment variables only (`.env.example` in the repo); secrets never committed.
 - The gRPC stubs of the block service are generated from the `.proto` at build time (`grpcio` / `grpcio-tools`) and are not committed; the Docker images of the client and the DataNodes include that step.

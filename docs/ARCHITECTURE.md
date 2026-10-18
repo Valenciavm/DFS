@@ -454,9 +454,10 @@ The pipeline is only the plan. A node counts as a replica of a block when it con
 DFS/
 ├── README.md              # how to run everything + links
 ├── docs/
-│   ├── API.md             # contract
-│   ├── ARCHITECTURE.md    # this file
-│   └── NAMENODE_MODELS.md # code-level metadata reference
+│   ├── API.md               # contract
+│   ├── ARCHITECTURE.md      # this file
+│   ├── NAMENODE_MODELS.md   # code-level metadata reference
+│   └── GRPC_BLOCK_SERVICE.md # data plane implementation notes
 ├── proto/                 # .proto of the block service (gRPC), added by the DataNode owner
 ├── requirements.txt       # all dependencies, exact versions (==)
 ├── requirements-dev.txt   # optional: dev tools (pytest, ruff, mypy)

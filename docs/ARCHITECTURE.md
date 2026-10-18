@@ -785,6 +785,27 @@ What `models.py` and `namenode.py` already match, and what must change. "Adopted
 | 16 | Concurrency | Core methods are synchronous and will run in a thread pool once FastAPI serves them | Rules in Section 4.4 |
 | 17 | `models.py` | `MetadataStore` also holds the DataNode registry (`datanodes`) | Move DataNodes, pending commands and in-flight replications to a separate soft-state holder (`ClusterState`); `MetadataStore` keeps only hard state (see `NAMENODE_MODELS.md`) |
 
-### A.3 Not implemented yet (expected at this stage)
+### A.3 Status of the A.2 changes
 
-PostgreSQL implementation of `MetadataStore`, block tokens, authentication, ACLs and locks, `abort`, `get` / `ls` / `mkdir` / `rm` / `mv`, the leader lease with `term`, the re-replication logic itself (it is a placeholder today), and the REST layer.
+All seventeen are resolved in `server/nodes/namenode/` and covered by unit tests with a fake clock. Where the resolution is not the one A.2 originally proposed, it is noted:
+
+| # | Status |
+|---|---|
+| 1, 4 | Done. `pipelines` is the plan, `replicas` only holds confirmations, and the pipeline is chosen per block |
+| 2 | Done. Liveness uses the monotonic clock only; a test pins that a node which registers and never beats is declared dead |
+| 3 | Done. Replication scans `COMMITTED` files only (test plan T19) |
+| 5, 6, 7 | Done. `UPLOAD_IN_PROGRESS`, `ALREADY_EXISTS`, `overwrite` semantics, `NOT_ENOUGH_DATANODES`, and a real `expires_at` |
+| 8 | Done. Commit enforces the quorum against confirmed replicas on live nodes with matching checksums, is idempotent, and swaps versions in one step on overwrite |
+| 9 | Done. A heartbeat records real free space and returns the pending commands. The `term` is exposed as an attribute, ready for the REST layer to return it |
+| 10 | Done. Registration keeps known replica locations |
+| 11, 12 | Done. `name` + parent, children and files by name, and the missing fields |
+| 13 | Done. The NameNode serves REST only |
+| 14 | Done. Defaults come from `server/common/config.py` and the environment; the default owner is gone, the owner is always explicit |
+| 15 | Done. `file_id` is UUID4 (decision 15) |
+| 16 | Done. Every public method is synchronous and runs to completion, so it is atomic on the event loop |
+| 17 | Done. `MetadataStore` is an interface that holds hard state only; `ClusterState` holds the rest |
+| Reservation release | **Differs from the proposal.** Space is released at the event that ends the reservation rather than when a heartbeat "covers" it. See `NAMENODE_MODELS.md` Section 6.2 |
+
+### A.4 Not implemented yet
+
+The REST layer (FastAPI), the PostgreSQL implementation of `MetadataStore`, the leader lease with `term` fencing and the second NameNode, authentication (passwords, JWT, API keys, TOTP 2FA), ACLs, groups and locks, `mv`, batched block allocation (Section 6.3), the audit log, and the admin endpoints. The core already exposes what the admin endpoints need (`stats()`).

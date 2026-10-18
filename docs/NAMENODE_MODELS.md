@@ -1,4 +1,4 @@
-# DFSha — NameNode Metadata Models (v0.3)
+# DFSha — NameNode Metadata Models (v0.4)
 
 Code-level reference for `server/nodes/namenode/models.py`. It complements [`ARCHITECTURE.md`](ARCHITECTURE.md) (Section 5 explains the design, this file gives the Python shape) and follows the contract in [`API.md`](API.md). If they disagree, `API.md` wins for what crosses the wire and `ARCHITECTURE.md` wins for design.
 
@@ -238,10 +238,14 @@ Everything the leader learns from DataNodes. Lost on failover by design; rebuilt
 | `replicas` | `dict[str, set[str]]` | `block_id → node_ids` that **confirmed** a valid copy (via `block-received` or block report) |
 | `pipelines` | `dict[str, list[str]]` | `block_id → ordered node_ids` **allocated** for an upload. Allocation, not confirmation |
 | `pending_commands` | `dict[str, list[Command]]` | `node_id → commands` (`replicate`, `delete`) delivered in the next heartbeat response |
-| `in_flight_replications` | `dict[str, set[str]]` | `block_id → target node_ids` being copied, so the same block is not scheduled twice |
-| `reserved_bytes` | `dict[str, int]` | `node_id → bytes` promised to uploads in progress; subtracted from free space until a heartbeat covers it |
+| `replica_checksums` | `dict[str, dict[str, str]]` | `block_id → {node_id → checksum}` each confirming node computed. `commit` compares it with the checksum the client sent, which a bare set of ids cannot do |
+| `in_flight_replications` | `dict[str, dict[str, float]]` | `block_id → {target node_id → monotonic start}` being copied, so the same block is not scheduled twice and a copy that never finishes can time out |
+| `reserved_bytes` | `dict[str, int]` | `node_id → bytes` promised to uploads and copies in progress; subtracted from free space by placement |
+| `reservations` | `dict[str, dict[str, int]]` | `block_id → {node_id → bytes}` still held. Tracked per pair so a reservation is released **exactly once** however it ends (confirmed, committed, aborted, timed out, node died). Deriving it from `pipelines` minus `replicas` would release twice when a replica is later lost |
 
-Pipeline vs replicas is the key distinction: a block with 3 nodes in `pipelines` and 2 in `replicas` has been written to 2 nodes so far. `commit` succeeds when `len(replicas[block]) >= MIN_REPLICAS_COMMIT` for **every** block.
+Pipeline vs replicas is the key distinction: a block with 3 nodes in `pipelines` and 2 in `replicas` has been written to 2 nodes so far. `commit` succeeds when `len(replicas[block]) >= MIN_REPLICAS_COMMIT` for **every** block, counting only replicas on live nodes whose checksum equals the client's.
+
+**Where the reservation is released.** The earlier draft released it when a heartbeat "covered" the space. The code releases it at the precise event instead: when that node confirms the block, when the upload commits (unconfirmed hops never arrive), when it is aborted or expires, or when a copy times out or its target dies. A heartbeat cannot know which blocks it accounts for, so releasing on heartbeats either leaks space or frees it too early.
 
 Concurrency: all mutations happen on the event loop or under one lock; background tasks iterate over **snapshots** (`list(d.items())`), never the live dict (`ARCHITECTURE.md` Section 4.4).
 

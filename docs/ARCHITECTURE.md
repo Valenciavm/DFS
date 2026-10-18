@@ -62,9 +62,9 @@ High availability is part of the design from the start: two NameNodes (one leade
 | Client ↔ NameNode | REST/JSON over HTTPS | Metadata only; JWT or API key |
 | Client ↔ DataNode | **gRPC** (HTTP/2 + Protocol Buffers) over TLS | Block read/write, streamed in chunks; block token in call metadata |
 | DataNode ↔ DataNode | **gRPC** over TLS | Write pipeline and re-replication, forwarded chunk by chunk |
-| DataNode → NameNode | REST/JSON over HTTPS | Register, heartbeat, block report; commands come back in the response |
-| NameNode ↔ NameNode | Via PostgreSQL lease row | No direct channel needed |
-| NameNode ↔ PostgreSQL | SQL | Private network only |
+| DataNode → NameNode | REST/JSON over HTTPS, **mutual TLS** | Register, heartbeat, block report; commands come back in the response |
+| NameNode ↔ NameNode | REST/JSON over HTTPS, **mutual TLS** | `/v1/ha/status` and `/v1/ha/stepdown`: role and `term` discovery, leader handover, degraded-mode reporting. Coordination of record still goes through the lease row, so the channel is never required for correctness |
+| NameNode ↔ database | SQL over TLS | Private network only; only the primary is written (Section 5.2) |
 
 The NameNode serves **REST only**; gRPC exists only on the DataNodes (block service).
 

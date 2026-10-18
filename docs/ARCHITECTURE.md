@@ -381,9 +381,31 @@ There are **no** `datanodes` or `block_replicas` tables: that information is sof
 
 **6.2 Choosing DataNodes for each block (placement).**
 1. Candidates: live nodes whose `free_bytes − reserved_bytes` can hold the block. If there are fewer than `REPLICATION_FACTOR`, fail with `NOT_ENOUGH_DATANODES`.
-2. **For each block separately**, pick `REPLICATION_FACTOR` **distinct** nodes by weighted random sampling without replacement, with probability proportional to free space. Free space favors emptier nodes and the randomness makes consecutive blocks of the same file land on different sets of nodes, so a file is partitioned across the cluster (with exactly 3 nodes and factor 3 every block necessarily uses all three).
+2. **For each block separately**, pick `REPLICATION_FACTOR` **distinct** nodes by weighted random sampling without replacement, with probability proportional to free space. Free space favors emptier nodes and the randomness makes consecutive blocks of the same file land on different sets of nodes, so a file is partitioned across the cluster.
 3. Order each pipeline with the node that has the most free space first (it receives from the client).
 4. Add the block size to each chosen node's `reserved_bytes`.
+
+> **The cluster needs more nodes than the replication factor.** The statement asks for two separate properties: files spread across nodes, **and** each file spread across nodes. With exactly `REPLICATION_FACTOR` nodes the placement algorithm has no freedom — every block must use every node — so each DataNode ends up holding a full copy of every file and partitioning becomes indistinguishable from mirroring. Measured on a three-node cluster: a 5 MB file in six blocks produced six identical block files on all three nodes.
+>
+> Worse, **re-replication becomes impossible**: repairing a block needs a live node that does not already hold it, and with three nodes and factor 3 no such node can exist, so `under_replicated_blocks` would never return to 0 and scenarios T4 and T13 could not run.
+>
+> Hence the minimum of **five DataNodes** in Section 10. With five nodes and factor 3 each node holds roughly three fifths of the blocks: no node has the whole file, every block still has three copies, and both properties are observable and independent.
+
+**6.5 Incremental block allocation.**
+`put` does **not** allocate the whole file up front. It reserves the path and returns a `file_id`; the client then requests blocks in batches as it uploads, and declares the total size at `commit`.
+
+Allocating everything in one response had four problems, all of them growing with file size:
+
+| Problem | Why |
+|---|---|
+| Response size grows with the file | Each block entry carries `block_id`, size, token and a pipeline of three nodes with two addresses each. A 1 TB file at 64 MB blocks is ~16 000 blocks, so a multi-megabyte JSON response before a single byte is uploaded. This is the real origin of `MAX_FILE_SIZE_BYTES` |
+| Tokens expire mid-upload | Tokens live `TOKEN_TTL_S`; on a long upload the last blocks' tokens expire before the client reaches them, which is what the `/tokens` renewal endpoint exists to patch |
+| Placement decided with stale information | Pipelines for blocks written an hour later are chosen against the cluster as it was at time zero, when nodes may since have died or filled up |
+| Capacity reserved for the whole file | A large upload holds `reserved_bytes` across the cluster for its entire duration, distorting placement for everyone else |
+
+With batched allocation each batch gets fresh tokens and pipelines computed from the **current** cluster state, only the in-flight window is reserved, and the size no longer has to be known in advance, which allows uploading from a stream. The cost is one extra round trip per batch, amortized over 8–16 blocks, and a batching loop in the client. `MAX_FILE_SIZE_BYTES` disappears as a bound (it may stay as a per-user quota).
+
+This changes the contract in `API.md` Sections 5.1 and 5.5, so it lands with a version bump when it is implemented, not before.
 
 **6.3 Allocation versus confirmation.**
 The pipeline is only the plan. A node counts as a replica of a block when it confirms (`block-received`) or reports the block in a block report. The write quorum (`MIN_REPLICAS_COMMIT`) is checked against **confirmed** replicas, never against the pipeline.
@@ -436,7 +458,7 @@ The pipeline is only the plan. A node counts as a replica of a block when it con
 | Dimension | How DFSha scales / what limits it |
 |---|---|
 | **Storage capacity & throughput** | Add DataNodes: they register themselves and receive new blocks (free-space-weighted placement). Clients move bytes **directly** to/from DataNodes, so aggregate throughput grows with the number of nodes. |
-| **File size** | Files are split into blocks; blocks are placed independently. Bound: `MAX_FILE_SIZE_BYTES` because `put` allocates all blocks up front (documented; incremental allocation is a future improvement). |
+| **File size** | Files are split into blocks; blocks are placed independently, and blocks are **allocated in batches as the upload progresses** (Section 6.5), so neither the `put` response nor the reserved capacity grows with the file. No architectural bound on file size; `MAX_FILE_SIZE_BYTES` survives only as an optional per-user quota. |
 | **Number of files** | Hard state in PostgreSQL with indexes on `(parent_id, name)`; `ls` is paginated; the leader serves reads from an in-memory cache. Rough order of magnitude: 1 PB at 64 MB blocks ≈ 16 million block rows — manageable for PostgreSQL. |
 | **Number of users** | The NameNode does small work per request (no data passes through it). Block tokens are validated by DataNodes locally, with no NameNode round trip. |
 | **Concurrency** | Parallel block transfers in the client; concurrent readers and writers on different paths; the NameNode core is atomic per call (Section 4.4). |

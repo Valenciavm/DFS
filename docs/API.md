@@ -69,6 +69,9 @@ Clients only ever receive `public_addr` values (called `addr` in the NameNode re
 | `DEAD_NODE_TIMEOUT_S` | 30 | No heartbeat for this long ⇒ node is considered dead |
 | `BLOCK_REPORT_INTERVAL_S` | 60 | DataNode → NameNode |
 | `TOKEN_TTL_S` | 900 | Block token lifetime (renewable, see 5.5) |
+| `JWT_TTL_S` | 3600 | NameNode access-token lifetime |
+| `JWT_SECRET` | required | HS256 signing secret for NameNode access tokens; never commit it |
+| `ADMIN_USER` / `ADMIN_PASSWORD` | unset | Optional pair that bootstraps the first admin account on first start |
 | `UPLOAD_TTL_S` | 3600 | A `put` that is never committed is garbage-collected after this |
 | `LS_DEFAULT_LIMIT` | 1000 | Default page size for `ls` |
 | `LEASE_S` | 15 | NameNode leader lease duration (Section 9) |

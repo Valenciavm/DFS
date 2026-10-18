@@ -5,6 +5,7 @@ import pytest
 
 from server.common.errors import ErrorCode
 from server.common.tokens import BlockOp, verify
+from server.nodes.namenode.auth_models import User
 from server.nodes.namenode.models import DirectoryMetadata, FileMetadata
 from server.nodes.namenode.tests.conftest import SECRET
 from server.nodes.namenode.tests.helpers import (
@@ -45,6 +46,10 @@ class TestGetFileBlocks:
 
     def test_each_block_has_a_read_token_bound_to_it_and_the_user(self, cluster, clock):
         upload(cluster, f"{HOME}/f", 8 * MIB)
+        cluster.auth_store.create_user(
+            User("bruno", "unused-password-hash", "user", clock.time())
+        )
+        cluster.set_acl(f"{HOME}/f", "user:bruno", "r", user="ana")
         first, second = cluster.get_file_blocks(f"{HOME}/f", "bruno").blocks
 
         claims = verify(first.token, SECRET, block_id=first.block.block_id, op=BlockOp.READ,

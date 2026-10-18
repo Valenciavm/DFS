@@ -177,12 +177,12 @@ class TestPrepareValidation:
 class TestConflicts:
     def test_a_second_upload_to_the_same_path_is_in_progress(self, cluster):
         cluster.prepare_file_upload(f"{HOME}/f", MIB, "ana")
-        assert code_of(lambda: cluster.prepare_file_upload(f"{HOME}/f", MIB, "bruno")) is ErrorCode.UPLOAD_IN_PROGRESS
+        assert code_of(lambda: cluster.prepare_file_upload(f"{HOME}/f", MIB, "ana")) is ErrorCode.UPLOAD_IN_PROGRESS
 
     def test_an_expired_upload_no_longer_blocks_the_path(self, cluster, clock):
         old = cluster.prepare_file_upload(f"{HOME}/f", MIB, "ana")
         clock.advance(cluster.settings.upload_ttl_s + 1)
-        fresh = cluster.prepare_file_upload(f"{HOME}/f", MIB, "bruno")
+        fresh = cluster.prepare_file_upload(f"{HOME}/f", MIB, "ana")
         assert fresh.file.file_id != old.file.file_id
         assert cluster.store.get_file_by_id(old.file.file_id).status is FileStatus.ABORTED
 

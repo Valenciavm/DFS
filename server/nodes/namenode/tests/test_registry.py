@@ -194,7 +194,7 @@ class TestLiveness:
         nn = Namenode(
             settings=Settings(
                 block_token_secret="s", heartbeat_interval_s=1, dead_node_timeout_s=3,
-                failover_grace_s=2,
+                failover_grace_s=2, jwt_secret="test-jwt-secret-for-signing-tests-32-bytes",
             ),
             clock=clock,
             rng=random.Random(1),

@@ -116,7 +116,13 @@ class TestRebuildingAfterFailover:
         plan = upload(cluster, f"{HOME}/f", 12 * MIB)
         truth = {nid: report_for(cluster, nid) for nid in cluster.cluster.datanodes}
 
-        successor = Namenode(settings=settings, store=cluster.store, clock=clock, rng=random.Random(1))
+        successor = Namenode(
+            settings=settings,
+            store=cluster.store,
+            clock=clock,
+            rng=random.Random(1),
+            auth_store=cluster.auth_store,
+        )
         assert successor.cluster.replicas == {}, "a new leader starts knowing nothing"
         for node_id in cluster.cluster.datanodes:
             successor.register_datanode(node_id, f"{node_id}:9000", f"{node_id}.example.com:9000", 100 << 30)
@@ -134,7 +140,13 @@ class TestRebuildingAfterFailover:
         for node in plan.blocks[0].pipeline:
             cluster.record_block_received(node.node_id, plan.blocks[0].block.block_id, 4 * MIB,
                                           checksum_of(plan.blocks[0].block.block_id))
-        successor = Namenode(settings=settings, store=cluster.store, clock=clock, rng=random.Random(1))
+        successor = Namenode(
+            settings=settings,
+            store=cluster.store,
+            clock=clock,
+            rng=random.Random(1),
+            auth_store=cluster.auth_store,
+        )
         for node_id in cluster.cluster.datanodes:
             successor.register_datanode(node_id, f"{node_id}:9000", f"{node_id}.example.com:9000", 100 << 30)
 

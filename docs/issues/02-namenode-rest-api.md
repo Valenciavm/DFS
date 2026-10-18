@@ -1,11 +1,10 @@
 # NameNode REST API (FastAPI layer)
 
-**Depends on:** issue 01 (auth and ACL) merged. Do not expose the core over
-HTTP before permissions are enforced.
+**Depends on:** the auth/ACL core pull request merged. Do not expose the core
+over HTTP before permissions are enforced.
 **Branch:** `feat/namenode-rest-api`, from the tip of the auth branch.
-**Unblocks:** issue 04 (DataNode control loop), issue 05 depends on this only
-loosely (it's mostly gRPC-side), issue 08 (client library needs a server to
-talk to).
+**Unblocks:** issue 04 (DataNode control loop) and issue 08 (client library
+needs a server to talk to).
 
 ## Context you need
 
@@ -29,8 +28,8 @@ is the pinned dependency (`requirements.txt`: `fastapi`, `uvicorn`,
 
 Read `docs/API.md` in full — it is the literal spec for every endpoint, every
 request/response shape, every error code. This issue implements Sections
-2 (partially — JWT/API key extraction, not issuance, which issue 01 already
-built), 3 (error format), 4 (namespace: ls/stat/mkdir/rmdir/rm/mv/acl, and
+2 (partially — JWT/API key extraction, not issuance, which the auth core
+provides), 3 (error format), 4 (namespace: ls/stat/mkdir/rmdir/rm/mv/acl, and
 locks), 5 (file put/get/commit/abort/tokens), 7 (DataNode-facing endpoints:
 register/heartbeat/block-report/block-received/block-corrupt), 8 (admin/stats),
 and 9's `/v1/ha/status` (the lease/second-NameNode logic itself is issue 06 —
@@ -54,7 +53,7 @@ there's only one NameNode until issue 06).
   exception handler that catches `DfshaError` and returns
   `JSONResponse(status_code=e.http_status, content=e.to_body())` is most of
   your error handling, in one place.
-- Issue 01 (once merged) gives you: user auth, JWT issuance/verification, API
+- The auth/ACL core gives you: user auth, JWT issuance/verification, API
   key verification, ACL enforcement already happening *inside* the core
   methods you call — so your job is to **extract the caller identity** from
   the request (JWT bearer token or API key header) and pass it as the `user`
@@ -80,7 +79,7 @@ server/nodes/namenode/
     deps.py         # dependency-injected current-user extraction, shared Namenode instance
     schemas.py       # Pydantic request/response models
     routes/
-      auth.py        # /v1/auth/*  (register, login, login/2fa, apikeys) — thin wrappers over issue 01's methods
+      auth.py        # /v1/auth/*  (register, login, login/2fa, apikeys) — thin wrappers over the auth core
       fs.py           # /v1/fs/*   (ls, stat, mkdir, rmdir, rm, mv, acl, lock/unlock)
       files.py        # /v1/files/* (put, tokens, commit, abort, get)
       nodes.py        # /v1/nodes/* (register, heartbeat, block-report, block-received, block-corrupt)
@@ -93,8 +92,8 @@ server/nodes/namenode/
 - **`X-Request-Id` header** (`API.md` Section 1, "Tracing"): every component
   echoes it in the response and includes it in logs; if absent, generate one
   (`uuid4`). Implement as FastAPI middleware, and pass it through to the
-  audit log calls from issue 01 (you may need to extend those method
-  signatures — check what issue 01 left room for).
+  audit log calls from the auth core (you may need to extend those method
+  signatures — check what extension points the auth core provides.
 - **Pagination** (`API.md` Section 4.3, `ls`): `?limit=1000&cursor=...`,
   response includes `next_cursor` (`null` when done). The core's `ls` method
   (`core.py`) currently returns a plain `list[DirEntry]` with no pagination —
@@ -103,9 +102,9 @@ server/nodes/namenode/
   the full list. Prefer extending the core method (cleaner, and the admin
   endpoints might want pagination too later) — but that means touching
   `core.py` and its tests, so budget time for it, and keep it backward
-  compatible with issue 01's and PR #4's existing callers (default
+  compatible with the auth core and PR #4's existing callers (default
   `limit=LS_DEFAULT_LIMIT` matches `server/common/config.py`).
-- **`PUT /v1/fs/acl`, `GET /v1/fs/acl`** — these call into issue 01's
+- **`PUT /v1/fs/acl`, `GET /v1/fs/acl`** — these call into the auth core's
   `set_acl`/`get_acl` core methods (or store methods, depending on how issue
   01 was implemented — check).
 - **Locks** (`API.md` Section 4.4: `POST /v1/fs/lock`, `POST
@@ -132,17 +131,17 @@ server/nodes/namenode/
   (read `core.py` carefully — there's a private `_place` method you can
   likely reuse or adapt; don't duplicate the placement call).
 - **Admin endpoints** (`API.md` Section 8) require `role: admin` — this
-  depends on issue 01's role model.
+  depends on the auth core's role model.
 - **`/health`** needs no auth (`API.md` Section 8).
 
 ## What NOT to build here
 
 - TOTP/2FA endpoints (`/v1/auth/2fa/*`, `/v1/auth/login/2fa`'s actual code
-  verification) — issue 01 deliberately deferred the TOTP math; this issue
-  should wire the routes to whatever issue 01 left as the extension point,
-  but if issue 01 left a `NotImplementedError`, you can either leave the
+  verification) — the auth core deliberately defers the TOTP math; this issue
+  should wire the routes to the auth core's extension point, but if it raises
+  `NotImplementedError`, you can either leave the
   route stubbed with a clear `501 Not Implemented` + comment, or implement
-  the TOTP verification yourself if issue 01 wasn't done thoroughly — check
+  the TOTP verification yourself if the auth core left a gap — check
   before assuming. Issue 07 (security) is the one explicitly scoped to finish
   this if it's still open.
 - The leader lease / `term` fencing / second NameNode (issue 06). For now,

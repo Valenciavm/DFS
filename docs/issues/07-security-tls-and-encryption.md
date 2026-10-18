@@ -1,10 +1,11 @@
 # Security hardening: TLS/mTLS, AES-256-GCM at rest and TOTP 2FA
 
-**Depends on:** issue 01 for user/auth models, issue 02 for HTTP wiring and
-issue 04 for node control traffic. Issue 05's gRPC interceptor is the natural
-place for block-token enforcement.
-**Branch:** `feat/security-hardening`, from the latest branch containing issues
-01, 02, 04 and 05, or split into smaller stacked PRs if the work is too large.
+**Depends on:** the auth/ACL core pull request for user/auth models, issue 02
+for HTTP wiring and issue 04 for node control traffic. PR #6 added the gRPC
+block-token interceptor.
+**Branch:** `feat/security-hardening`, from the latest branch containing the
+auth/ACL core and issues 02 and 04, or split into smaller stacked PRs if the
+work is too large.
 **Unblocks:** issue 09 (secure deployment) and issue 10 (T9–T12, T21–T22).
 
 ## Context and rubric reason

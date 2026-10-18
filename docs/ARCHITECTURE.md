@@ -550,23 +550,23 @@ Tips: rehearse once, keep a pre-recorded backup of the slowest steps, use the de
 
 | Criterion (weight) | Where it is addressed | Evidence to show |
 |---|---|---|
-| **1. Service definition and architectural design (15%)** | §1, §2, §3, §4, §5, §10 of this file; `API.md` §0 | Requirement mapping table, architecture and component diagrams, flows, model and schema |
-| **2. Communications specifications (15%)** | `API.md` (all sections), §2 here | Documented interfaces for client↔NN, client↔DN, DN↔DN, NN↔DN, NN↔NN; OpenAPI at `/docs` (REST) and the `.proto` (gRPC block service); error model with HTTP and gRPC status mapping; examples |
-| **3. Scalability design (15%)** | §6, §8, §11 here; `API.md` §5.1, §7 (placement, pagination) | T13, T15, charts, honest bottleneck analysis |
-| **4. High availability (15%)** | §7 (failure table), §3, §4, §5.2 here; `API.md` §7, §9 | T3, T4, T5, T16, T17 live |
-| **5. Replication and data consistency (15%)** | §6, §7 here; `API.md` §5.2, §5.4, §6 | T1, T6, T7, T8, T18 |
-| **6. Security (15%)** | §9 here; `API.md` §2, §4.1, §4.2 | T9–T12, audit log, code review of token validation |
-| **7. Video and final report (10%)** | §12, §13 here | Video plan; report built from this file + test results; reproducible repository (`README`, `docker-compose`, `.env.example`) |
+| **1. Service definition and architectural design (15%)** | Sections 1, 2, 3, 4, 5 and 10 of this file; `API.md` Section 0 | Requirement mapping table, architecture and component diagrams, flows, model and schema |
+| **2. Communications specifications (15%)** | `API.md` (all sections), Section 2 here | Documented interfaces for client↔NN, client↔DN, DN↔DN, NN↔DN, NN↔NN; OpenAPI at `/docs` (REST) and the `.proto` (gRPC block service); error model with HTTP and gRPC status mapping; examples |
+| **3. Scalability design (15%)** | Sections 6, 8 and 11 here; `API.md` Sections 5.1 and 7 (placement, pagination) | T13, T15, charts, honest bottleneck analysis |
+| **4. High availability (15%)** | Section 7 (failure table), Sections 3, 4 and 5.2 here; `API.md` Sections 7 and 9 | T3, T4, T5, T16, T17 live |
+| **5. Replication and data consistency (15%)** | Sections 6 and 7 here; `API.md` Sections 5.2, 5.4 and 6 | T1, T6, T7, T8, T18 |
+| **6. Security (15%)** | Section 9 here; `API.md` Sections 2, 4.1 and 4.2 | T9–T12, audit log, code review of token validation |
+| **7. Video and final report (10%)** | Sections 12 and 13 here | Video plan; report built from this file + test results; reproducible repository (`README`, `docker-compose`, `.env.example`) |
 
 ### Final report outline (from the deliverables list)
 
 1. Objective and short theoretical framework (GFS, HDFS, block vs object storage)
 2. Service description and problem
-3. Architecture and diagrams (§2, §3 and §4 here)
+3. Architecture and diagrams (Sections 2 and 3 and Section 4 here)
 4. Protocol and API specification (`API.md`)
-5. Partitioning and distribution algorithms (§5 and §6)
+5. Partitioning and distribution algorithms (Section 5 and Section 6)
 6. Execution environment (Docker, topology)
-7. Tests and result analysis (§11, §12)
+7. Tests and result analysis (Sections 11 and 12)
 8. Limitations and future work
 
 ---
@@ -602,14 +602,14 @@ Tips: rehearse once, keep a pre-recorded backup of the slowest steps, use the de
 | # | Topic | Options / notes |
 |---|---|---|
 | A | **Namespace per user.** `API.md` says each user sees their own root `/`, but also that paths can be shared by ACL; today nothing says how a user addresses a file owned by someone else | One global tree with `/users/<name>` hidden by the client, or explicit shared paths. Changes the model, so decide before the schema is final |
-| B | `file_id` format | UUID (as in `API.md`) or opaque id (as in the code: `file_` + 12 hex). If opaque, `API.md` §1 is relaxed |
+| B | `file_id` format | UUID (as in `API.md`) or opaque id (as in the code: `file_` + 12 hex). If opaque, `API.md` Section 1 is relaxed |
 | C | Default `BLOCK_SIZE` | Contract: 64 MB (demo 1 MB); code: 4 MB. Pick one default and read it from an environment variable |
 | D | `UPLOAD_TTL` | Contract: 3600 s; code: 300 s |
 | E | Heartbeat from an unknown node | Respond with an error that makes the DataNode register again; the error code must be added to `API.md` |
 | F | Self-signed CA vs public certificates for the demo | Self-signed (fast) / Let's Encrypt (needs domains) |
 | G | PostgreSQL replica for HA of the database | Stretch goal / state as a limitation |
 | H | Client-side encryption (`--encrypt`) | Stretch goal |
-| I | Exact `.proto` of the block service | DataNode owner proposes it by PR; it must follow `API.md` §6 |
+| I | Exact `.proto` of the block service | DataNode owner proposes it by PR; it must follow `API.md` Section 6 |
 
 ---
 
@@ -621,36 +621,36 @@ What `models.py` and `namenode.py` already match, and what must change. "Adopted
 
 | Element | Where it lives in this document |
 |---|---|
-| `FileStatus` (`PENDING`, `COMMITTED`, `ABORTED`), invisible until commit | §3, §4.3, §5.4 |
-| `FileMetadata` with `owner`, `created_at`, `expires_at` | §5.4 |
-| `DataNodeInfo` with `is_alive`, `last_heartbeat`, derived `free_bytes`, `address` as `host:port` for gRPC | §5.4 (now with `internal_addr` and `public_addr`) |
-| Indexes `files_by_id`, `files_by_path`, `blocks_by_id` | §5.2, §5.4 |
-| Tasks `monitor_datanodes`, `monitor_replication`, `garbage_collector`, `api_server` | §4.2 |
-| `ceil` block count with minimum of 1 | §6.1 |
-| Placement by free space | §6.2 (now weighted and per block) |
-| Heartbeat returns the node's pending commands | §4.3 |
-| Class diagram of the metadata model | §5.3 (extended) |
+| `FileStatus` (`PENDING`, `COMMITTED`, `ABORTED`), invisible until commit | Sections 3, 4.3 and 5.4 |
+| `FileMetadata` with `owner`, `created_at`, `expires_at` | Section 5.4 |
+| `DataNodeInfo` with `is_alive`, `last_heartbeat`, derived `free_bytes`, `address` as `host:port` for gRPC | Section 5.4 (now with `internal_addr` and `public_addr`) |
+| Indexes `files_by_id`, `files_by_path`, `blocks_by_id` | Sections 5.2 and 5.4 |
+| Tasks `monitor_datanodes`, `monitor_replication`, `garbage_collector`, `api_server` | Section 4.2 |
+| `ceil` block count with minimum of 1 | Section 6.1 |
+| Placement by free space | Section 6.2 (now weighted and per block) |
+| Heartbeat returns the node's pending commands | Section 4.3 |
+| Class diagram of the metadata model | Section 5.3 (extended) |
 
 ### A.2 Changes required in the code
 
 | # | Where | Current behavior | Target |
 |---|---|---|---|
-| 1 | `prepare_file_upload` | `replicas` is filled with the pipeline at allocation time | Keep a separate `pipeline` (plan); `replicas` only from `block-received` / block reports (§6.3) |
-| 2 | `monitor_datanodes`, `record_heartbeat`, `DataNodeInfo` | Loop time (`monotonic`) compared with `time.time()` defaults, so a node that registers and never sends a heartbeat is never marked dead | One monotonic clock for liveness (§4.4) |
-| 3 | `monitor_replication` | Iterates all blocks, including those of `PENDING` files | Only blocks of `COMMITTED` files (§4.2) |
-| 4 | `prepare_file_upload` | One pipeline reused for every block | Pipeline chosen per block, weighted by free space (§6.2) |
-| 5 | `prepare_file_upload` | A `PENDING` upload on the same path is silently overwritten; no `overwrite` option | `UPLOAD_IN_PROGRESS`, `ALREADY_EXISTS`, and `overwrite` semantics (§4.3) |
-| 6 | `prepare_file_upload` | No check on the number of live DataNodes | `NOT_ENOUGH_DATANODES` (§4.3) |
-| 7 | `prepare_file_upload` | `expires_at` is never set | `expires_at = now + UPLOAD_TTL_S` (§4.3) |
-| 8 | `commit_file_upload` | No quorum, size or checksum verification; not idempotent; does not link the file into the directory | Rules in §4.3 |
-| 9 | `record_heartbeat` | Ignores `free_bytes` / `used_bytes`; returns only replication commands; no `term` | Update free space; return `{ term, commands }` including deletes (§4.3) |
+| 1 | `prepare_file_upload` | `replicas` is filled with the pipeline at allocation time | Keep a separate `pipeline` (plan); `replicas` only from `block-received` / block reports (Section 6.3) |
+| 2 | `monitor_datanodes`, `record_heartbeat`, `DataNodeInfo` | Loop time (`monotonic`) compared with `time.time()` defaults, so a node that registers and never sends a heartbeat is never marked dead | One monotonic clock for liveness (Section 4.4) |
+| 3 | `monitor_replication` | Iterates all blocks, including those of `PENDING` files | Only blocks of `COMMITTED` files (Section 4.2) |
+| 4 | `prepare_file_upload` | One pipeline reused for every block | Pipeline chosen per block, weighted by free space (Section 6.2) |
+| 5 | `prepare_file_upload` | A `PENDING` upload on the same path is silently overwritten; no `overwrite` option | `UPLOAD_IN_PROGRESS`, `ALREADY_EXISTS`, and `overwrite` semantics (Section 4.3) |
+| 6 | `prepare_file_upload` | No check on the number of live DataNodes | `NOT_ENOUGH_DATANODES` (Section 4.3) |
+| 7 | `prepare_file_upload` | `expires_at` is never set | `expires_at = now + UPLOAD_TTL_S` (Section 4.3) |
+| 8 | `commit_file_upload` | No quorum, size or checksum verification; not idempotent; does not link the file into the directory | Rules in Section 4.3 |
+| 9 | `record_heartbeat` | Ignores `free_bytes` / `used_bytes`; returns only replication commands; no `term` | Update free space; return `{ term, commands }` including deletes (Section 4.3) |
 | 10 | `register_datanode` | One `address`; replaces the whole entry | `internal_addr` + `public_addr`; keep known replica locations |
-| 11 | `models.py` | Every node stores its full `path`; `parent` ↔ `children` cycle | `name` + parent, children and files indexed by name (§5.4) |
-| 12 | `models.py` | `FileMetadata` lacks `block_size`, `replication`, `checksum`, `modified_at`; `DirectoryMetadata` lacks timestamps | Add them (§5.4) |
-| 13 | `namenode.py` | `api_server` comment says "HTTP/gRPC" | The NameNode serves REST only (§2) |
+| 11 | `models.py` | Every node stores its full `path`; `parent` ↔ `children` cycle | `name` + parent, children and files indexed by name (Section 5.4) |
+| 12 | `models.py` | `FileMetadata` lacks `block_size`, `replication`, `checksum`, `modified_at`; `DirectoryMetadata` lacks timestamps | Add them (Section 5.4) |
+| 13 | `namenode.py` | `api_server` comment says "HTTP/gRPC" | The NameNode serves REST only (Section 2) |
 | 14 | `namenode.py` | Defaults as constants (4 MB block, 300 s upload TTL) and default owner `"default_user"` (vs `"system"` in `models.py`) | Read from environment variables with the contract defaults; owner from the authenticated user (open questions C and D) |
 | 15 | `file_id` | `file_` + 12 hex | Open question B |
-| 16 | Concurrency | Core methods are synchronous and will run in a thread pool once FastAPI serves them | Rules in §4.4 |
+| 16 | Concurrency | Core methods are synchronous and will run in a thread pool once FastAPI serves them | Rules in Section 4.4 |
 | 17 | `models.py` | `MetadataStore` also holds the DataNode registry (`datanodes`) | Move DataNodes, pending commands and in-flight replications to a separate soft-state holder (`ClusterState`); `MetadataStore` keeps only hard state (see `NAMENODE_MODELS.md`) |
 
 ### A.3 Not implemented yet (expected at this stage)

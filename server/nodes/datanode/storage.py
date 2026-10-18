@@ -19,6 +19,14 @@ class StorageManager:
         """Devuelve la ruta absoluta en disco del archivo del bloque."""
         return os.path.join(self.storage_dir, f"{block_id}.dat")
 
+    def get_temp_block_path(self, block_id: str) -> str:
+        """Devuelve la ruta de un archivo temporal antes de validar su integridad."""
+        return os.path.join(self.storage_dir, f"{block_id}.tmp")  # ruta temporal mientras se reciben chunks
+
+    def count_blocks(self) -> int:
+        """Cuenta los bloques definitivos almacenados en este nodo."""
+        return len([f for f in os.listdir(self.storage_dir) if f.endswith(".dat")])
+
     def write_block(self, block_id: str, data: bytes) -> str:
         """Escribe un bloque completo en el disco y retorna su hash SHA-256."""
         path = self.get_block_path(block_id)  # obtiene la ruta de destino

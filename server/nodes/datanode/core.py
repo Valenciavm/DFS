@@ -1,7 +1,12 @@
 """DataNode lifecycle: block server plus the control channel to the NameNode."""
 import os
 import asyncio
+from typing import Optional
 
+import grpc
+
+from proto import block_service_pb2_grpc as pb2_grpc
+from server.nodes.datanode.block_service import BlockServiceImpl
 from server.nodes.datanode.storage import StorageManager
 
 # Configuración por defecto del DataNode
@@ -26,6 +31,7 @@ class DataNode:
         self.address = f"{grpc_host}:{grpc_port}"  # direccion completa entregada al cliente
         self.namenode_url = namenode_url  # url del namenode para enviar rest
         self.storage = StorageManager(storage_dir)  # gestor del disco duro local
+        self.grpc_server: Optional[grpc.aio.Server] = None  # instancia del servidor grpc
 
     async def run(self):
         """Ciclo de vida principal del DataNode: registro y tareas en paralelo."""
@@ -83,11 +89,20 @@ class DataNode:
     # -------------------------------------------------------------------------
 
     async def start_grpc_server(self):
-        """Levanta el servidor gRPC que atiende peticiones WriteBlock y ReadBlock."""
-        # aqui se iniciara el servidor gRPC asincrono (grpc.aio.server)
-        print(f"[DataNode {self.node_id}] Servidor gRPC escuchando en {self.address}...")
-        while True:
-            await asyncio.sleep(3600)  # mantiene vivo el servidor de bloques
+        """Inicia el servidor gRPC asíncrono para atender WriteBlock y ReadBlock."""
+        self.grpc_server = grpc.aio.server()  # crea el servidor grpc asincrono
+        pb2_grpc.add_BlockServiceServicer_to_server(
+            BlockServiceImpl(self), self.grpc_server
+        )  # registra el servicio en el servidor
+        # TODO(security): TLS en lugar de puerto inseguro (API.md seccion 2.3)
+        self.grpc_server.add_insecure_port(f"{self.grpc_host}:{self.grpc_port}")  # abre el puerto tcp
+
+        await self.grpc_server.start()  # inicia la escucha en segundo plano
+        print(
+            f"[DataNode {self.node_id}] Servidor gRPC activo en {self.address} "
+            f"(Almacenamiento: {self.storage.storage_dir})"
+        )
+        await self.grpc_server.wait_for_termination()  # mantiene vivo el servidor
 
     async def replicate_block_to_node(self, block_id: str, target_address: str):
         """Envía una copia de un bloque local hacia otro DataNode por gRPC."""

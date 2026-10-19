@@ -599,6 +599,7 @@ class DFShaClient:
                 "/v1/files/get",
                 params={"path": remote},
             )
+            return DFSFile(self, manifest, lock_id=lock_id)
         except Exception:
             if lock_id is not None:
                 try:
@@ -608,7 +609,6 @@ class DFShaClient:
                         "Unable to release lock %s after open failed", lock_id
                     )
             raise
-        return DFSFile(self, manifest, lock_id=lock_id)
 
     def send(self, local_path, remote_path, overwrite=False):
         """Alias for uploading a local file to DFSha."""

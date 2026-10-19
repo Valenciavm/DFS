@@ -86,6 +86,16 @@ class ClientTests(unittest.TestCase):
         with self.assertRaisesRegex(NotImplementedError, "WORM"):
             self.client.open("file.txt", mode="wb")
 
+    def test_open_releases_lock_if_manifest_is_invalid(self):
+        self.client.http.request.return_value = {"size": 5, "blocks": []}
+        self.client.lock = Mock(return_value={"lock_id": "lock-1"})
+        self.client.unlock = Mock()
+
+        with self.assertRaisesRegex(OSError, "block sizes"):
+            self.client.open("file.txt", lock="shared")
+
+        self.client.unlock.assert_called_once_with("lock-1")
+
     def test_upload_uses_path_commit_and_checksum(self):
         payload = b"dfs"
         checksum = hashlib.sha256(payload).hexdigest()

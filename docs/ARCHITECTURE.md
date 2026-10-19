@@ -214,6 +214,11 @@ Consequence: PostgreSQL is touched only by metadata operations (`mkdir`, `put`, 
 
 ### 5.2 High availability from the start
 
+This section describes the target HA architecture. Issue 03 supplies durable
+PostgreSQL stores, snapshot reload and an optional write-fencing hook; it does
+not implement the lease election, database reconnection or automatic
+primary/standby promotion. Those service-level behaviors belong to issue 06.
+
 There is no interim single-NameNode version: from the first integration there are **two NameNodes sharing one replicated PostgreSQL cluster**, with leader election by lease. High availability and replication/consistency weigh 30% of the grade, and retrofitting persistence and failover into a core written for memory would mean rewriting it.
 
 The core talks to the hard state only through the `MetadataStore` interface. The real implementation is backed by PostgreSQL; an in-memory implementation exists **only for unit tests** (fake time, no database). The in-memory dictionaries (`files_by_id`, `files_by_path`, `blocks_by_id`) are the **leader's cache** over the database.
@@ -360,20 +365,30 @@ The code-level reference (Python types, defaults, invariants) is in [`NAMENODE_M
 
 | Table | Main columns |
 |---|---|
-| `users` | id, username (unique), password_hash, role (`user`/`admin`), created_at, **totp_secret (encrypted, nullable), totp_enabled, totp_last_step** |
+| `users` | id, username (unique), password_hash, role (`user`/`admin`), created_at, **totp_secret_encrypted (nullable), totp_enabled, totp_last_step** |
 | `recovery_codes` | user_id, code_hash, used_at · single-use 2FA fallback (Section 9.1) |
 | `api_keys` | id, user_id, name, key_hash, created_at, revoked_at |
 | `groups`, `group_members` | name, owner_id · group, user_id |
-| `inodes` | id, parent_id, name, type (`file`/`dir`), owner_id, current_file_id, created_at, modified_at · **unique (parent_id, name)** |
-| `files` | file_id, inode_id, owner_id, size, block_size, replication, status (`pending`/`committed`/`aborted`), checksum, created_at, expires_at |
-| `blocks` | block_id, file_id, idx, size, checksum |
+| `inodes` | id, parent_id, name, `kind` (`file`/`dir`), owner_id, current_file_id, created_at, modified_at · **unique (parent_id, name)** |
+| `files` | `file_id` UUID primary key, `file_id_key` opaque contract key, inode_id, owner_id, size_bytes, block_size, replication, status (`PENDING`/`COMMITTED`/`ABORTED`), checksum, created_at, modified_at, expires_at |
+| `blocks` | block_id, file_id, idx, size_bytes, checksum · **unique (file_id, idx)** |
 | `acls` | inode_id, subject (`user:x` / `group:y`), permission |
 | `locks` | lock_id, inode_id, owner_id, mode, expires_at |
 | `pending_deletes` | block_id, requested_at |
 | `leader` | holder, url, term, lease_expires_at (single row) |
-| `audit_log` | ts, user, operation, path, result, request_id |
+| `audit_log` | id, ts, username, operation, path, result, request_id |
 
 There are **no** `datanodes` or `block_replicas` tables: that information is soft state (Section 5.1).
+
+The numbered migration is the executable schema. `file_id_key` preserves the
+opaque string form used by the current store contract and tests; UUID file IDs
+retain their canonical UUID value. Primary keys and unique constraints provide
+the corresponding lookup indexes; the migration adds dedicated indexes for
+ACL subject, audit timestamp and other non-unique lookups. Every timestamp
+column is `TIMESTAMPTZ`, interpreted as UTC. The migration includes the leader
+singleton row for the later HA work, but issue 03 does not elect or promote a
+leader automatically. See [`POSTGRESQL.md`](POSTGRESQL.md) for database setup,
+opt-in integration tests and the manual replication acceptance procedure.
 
 ---
 

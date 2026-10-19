@@ -204,6 +204,8 @@ class InMemoryMetadataStore(MetadataStore):
 
     def abort_file(self, file_id: str, now: float) -> None:
         file = self._require(file_id)
+        if file.status is FileStatus.ABORTED:
+            return
         if file.status is not FileStatus.PENDING:
             raise ValueError(f"{file_id} is {file.status.value}, only PENDING can be aborted")
         self._pending.pop(self.path_of(file_id), None)

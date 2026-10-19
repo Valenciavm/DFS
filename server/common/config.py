@@ -88,6 +88,8 @@ class Settings:
     #: First admin bootstrapped on first start (ARCHITECTURE.md Section 9).
     admin_user: str = ""
     admin_password: str = field(default="", repr=False)
+    #: PostgreSQL URL enables the persistent metadata and auth stores.
+    postgres_dsn: str = field(default="", repr=False)
 
     def __post_init__(self) -> None:
         self.validate()
@@ -167,6 +169,7 @@ def load_settings() -> Settings:
         jwt_secret=_env_str("JWT_SECRET", ""),
         admin_user=_env_str("ADMIN_USER", ""),
         admin_password=_env_str("ADMIN_PASSWORD", ""),
+        postgres_dsn=_env_str("POSTGRES_DSN", ""),
     )
 
 

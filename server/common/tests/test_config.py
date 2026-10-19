@@ -30,6 +30,7 @@ def test_defaults_match_the_contract():
     assert s.jwt_secret == ""
     assert s.admin_user == ""
     assert s.admin_password == ""
+    assert s.postgres_dsn == ""
 
 
 def test_secrets_have_no_usable_default():
@@ -47,6 +48,7 @@ def test_environment_overrides_are_applied(monkeypatch):
     monkeypatch.setenv("JWT_SECRET", "jwt-secret")
     monkeypatch.setenv("ADMIN_USER", "root")
     monkeypatch.setenv("ADMIN_PASSWORD", "admin-password")
+    monkeypatch.setenv("POSTGRES_DSN", "postgresql://user:pass@localhost/dfsha")
     s = load_settings()
     assert s.block_size == 1 * MiB
     assert s.replication_factor == 5
@@ -55,6 +57,7 @@ def test_environment_overrides_are_applied(monkeypatch):
     assert s.jwt_secret == "jwt-secret"
     assert s.admin_user == "root"
     assert s.admin_password == "admin-password"
+    assert s.postgres_dsn == "postgresql://user:pass@localhost/dfsha"
 
 
 def test_jwt_lifetime_must_be_positive():

@@ -53,6 +53,7 @@ from server.nodes.namenode.models import (
     FileMetadata,
     FileStatus,
 )
+from server.nodes.namenode.postgres_auth_store import PostgresAuthStore
 from server.nodes.namenode.results import (
     BlockLocation,
     ClusterStats,
@@ -69,6 +70,7 @@ from server.nodes.namenode.store import (
     InMemoryMetadataStore,
     MetadataStore,
 )
+from server.nodes.namenode.store.postgres import PostgresDatabase, PostgresMetadataStore
 
 logger = logging.getLogger(__name__)
 
@@ -143,10 +145,22 @@ class Namenode:
             raise ConfigError("JWT_SECRET must be set: access tokens are signed with it")
         self.clock: Clock = clock if clock is not None else SystemClock()
         self.rng = rng if rng is not None else random.Random()
+        database = None
+        if store is None and self.settings.postgres_dsn:
+            database = PostgresDatabase(self.settings.postgres_dsn)
+            store = PostgresMetadataStore(database, now=self.clock.time())
         self.store: MetadataStore = (
             store if store is not None else InMemoryMetadataStore(now=self.clock.time())
         )
-        self.auth_store: AuthStore = auth_store if auth_store is not None else InMemoryAuthStore()
+        if auth_store is None:
+            if database is None and isinstance(self.store, PostgresMetadataStore):
+                database = self.store.database
+            auth_store = (
+                PostgresAuthStore(database)
+                if database is not None
+                else InMemoryAuthStore()
+            )
+        self.auth_store: AuthStore = auth_store
         self._password_hasher = PasswordHasher()
         self.cluster = ClusterState()
         #: leadership generation; fixed at 1 until the lease is implemented

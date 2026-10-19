@@ -8,25 +8,26 @@ set -eu
 : "${REPLICATION_USER:?REPLICATION_USER is required}"
 : "${REPLICATION_PASSWORD:?REPLICATION_PASSWORD is required}"
 : "${PGDATA:=/var/lib/postgresql/data}"
+: "${PGPASSFILE:=$PGDATA/.pgpass}"
 
 chmod 0700 "$PGDATA"
 
 if [ ! -s "$PGDATA/PG_VERSION" ]; then
-  passfile="$(mktemp)"
-  trap 'rm -f "$passfile"' EXIT HUP INT TERM
-  chmod 0600 "$passfile"
-  printf '%s:%s:replication:%s:%s\n' \
-    "$PRIMARY_HOST" "$PRIMARY_PORT" "$REPLICATION_USER" "$REPLICATION_PASSWORD" \
-    > "$passfile"
-
-  until pg_isready -h "$PRIMARY_HOST" -p "$PRIMARY_PORT" -U "$REPLICATION_USER"; do
-    sleep 2
-  done
-
   if [ -n "$(find "$PGDATA" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
     echo "Refusing to initialize replica over non-empty PGDATA without PG_VERSION" >&2
     exit 1
   fi
+
+  passfile="$(mktemp)"
+  trap 'rm -f "$passfile"' EXIT HUP INT TERM
+  printf '%s:%s:replication:%s:%s\n' \
+    "$PRIMARY_HOST" "$PRIMARY_PORT" "$REPLICATION_USER" "$REPLICATION_PASSWORD" \
+    > "$passfile"
+  chmod 0600 "$passfile"
+
+  until pg_isready -h "$PRIMARY_HOST" -p "$PRIMARY_PORT" -U "$REPLICATION_USER"; do
+    sleep 2
+  done
 
   PGPASSFILE="$passfile" pg_basebackup \
     --host="$PRIMARY_HOST" \
@@ -37,13 +38,20 @@ if [ ! -s "$PGDATA/PG_VERSION" ]; then
     --wal-method=stream \
     --write-recovery-conf \
     --progress
-  mv "$passfile" "$PGDATA/.pgpass"
-  chmod 0600 "$PGDATA/.pgpass"
+  mv "$passfile" "$PGPASSFILE"
+  chmod 0600 "$PGPASSFILE"
   trap - EXIT HUP INT TERM
-elif [ ! -f "$PGDATA/.pgpass" ]; then
-  echo "Replica data exists but its replication password file is missing" >&2
-  exit 1
+else
+  printf '%s:%s:replication:%s:%s\n' \
+    "$PRIMARY_HOST" "$PRIMARY_PORT" "$REPLICATION_USER" "$REPLICATION_PASSWORD" \
+    > "$PGPASSFILE"
+  chmod 0600 "$PGPASSFILE"
 fi
 
-export PGPASSFILE="$PGDATA/.pgpass"
+if [ -f "$PGDATA/postgresql.auto.conf" ]; then
+  sed -i "s|passfile=''[^']*''|passfile=''$PGPASSFILE''|" \
+    "$PGDATA/postgresql.auto.conf"
+fi
+
+export PGPASSFILE
 exec postgres -c hot_standby=on

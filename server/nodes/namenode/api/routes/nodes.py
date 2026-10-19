@@ -112,6 +112,5 @@ async def block_corrupt(
     nn.record_block_corrupt(
         node_id=req.node_id,
         block_id=req.block_id,
-        reason=req.reason,
     )
     return BlockCorruptResponse(status="ok")

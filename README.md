@@ -275,10 +275,11 @@ Compose; por eso conviene ejecutar el cliente dentro del servicio `client`.
 Los NameNodes y DataNodes escriben sus eventos de aplicación a los logs de
 Docker. Sus mensajes llevan fecha, servicio y nivel; `WARNING` aparece en
 amarillo, `ERROR` en rojo y los mensajes informativos en cian cuando la
-terminal admite colores. Los heartbeats correctos, los informes de bloques
-correctos y las consultas exitosas de `/health` se ocultan para que no llenen
-la salida. Si sigues viendo líneas `httpx: HTTP Request ... heartbeat ... 200
-OK`, actualiza y recrea los contenedores con la versión actual del código:
+terminal admite colores. Los checks exitosos de salud sí se muestran; solo se
+ocultan los heartbeats y los informes de bloques exitosos, que son tráfico
+frecuente entre nodos. Si sigues viendo líneas `httpx: HTTP Request ...
+heartbeat ... 200 OK`, actualiza y recrea los contenedores con la versión
+actual del código:
 
 ```sh
 docker compose up --build -d namenode1 namenode2 datanode1 datanode2 datanode3 datanode4 datanode5
@@ -299,9 +300,10 @@ docker compose ps
 
 Busca `Up ... (healthy)` para los NameNodes, DataNodes y PostgreSQL. Si algún
 servicio está `unhealthy`, `exited` o reiniciándose, inspecciona sus logs
-individuales con los ejemplos de abajo. El healthcheck de Docker comprueba la
-salud, pero sus comprobaciones exitosas no se imprimen continuamente en los
-logs de la aplicación.
+individuales con los ejemplos de abajo. Además, los logs de `namenode1` y
+`namenode2` muestran `GET /health ... 200`; cada DataNode muestra periódicamente
+`Health OK` con el espacio libre y el número de bloques. PostgreSQL no imprime
+cada `pg_isready` exitoso: su estado `healthy` aparece en `docker compose ps`.
 
 ### Ver logs individuales o por grupos
 
@@ -353,11 +355,11 @@ docker compose logs --follow namenode1 namenode2
 docker compose start datanode1
 ```
 
-Los heartbeats exitosos y las comprobaciones periódicas de `/health` se omiten
-de los logs HTTP de NameNode y DataNode para que no oculten los eventos
-relevantes; los errores HTTP siguen apareciendo. Cuando un DataNode almacena un
-bloque, sus logs muestran `Stored block` con el ID y tamaño. Si rechaza una
-réplica, busca `WARNING` o `ERROR` y revisa la dirección y el puerto del error.
+Los heartbeats e informes de bloques exitosos se omiten para reducir ruido;
+los healthchecks exitosos, los errores HTTP y los avisos de fallos sí aparecen.
+Cuando un DataNode almacena un bloque, sus logs muestran `Stored block` con el
+ID y tamaño. Si rechaza una réplica, busca `WARNING` o `ERROR` y revisa la
+dirección y el puerto del error.
 La detección y reparación toman tiempo. PostgreSQL tiene una réplica hot-standby,
 pero ambos NameNodes se conectan al primario: la promoción automática y el
 cambio de DSN no están implementados. La promoción manual está documentada en

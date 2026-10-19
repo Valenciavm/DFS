@@ -34,11 +34,10 @@ class ConsoleFormatter(logging.Formatter):
 
 
 class SuccessfulProbeFilter(logging.Filter):
-    """Hide successful liveness chatter while retaining failed requests."""
+    """Hide successful heartbeat traffic while retaining health probes."""
 
     _QUIET_PATHS = frozenset(
         {
-            ("GET", "/health"),
             ("POST", "/v1/nodes/heartbeat"),
             ("POST", "/v1/nodes/block-report"),
         }

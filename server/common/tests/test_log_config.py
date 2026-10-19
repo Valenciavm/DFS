@@ -87,3 +87,28 @@ def test_successful_httpx_heartbeat_logs_are_filtered_but_failures_remain():
 
     assert not log_filter.filter(successful)
     assert log_filter.filter(failed)
+
+
+def test_successful_health_probes_are_visible():
+    log_filter = SuccessfulProbeFilter()
+    httpx_health = logging.LogRecord(
+        "httpx",
+        logging.INFO,
+        "httpx",
+        1,
+        'HTTP Request: GET http://namenode1:8000/health "HTTP/1.1 200 OK"',
+        (),
+        None,
+    )
+    uvicorn_health = logging.LogRecord(
+        "uvicorn.access",
+        logging.INFO,
+        "uvicorn",
+        1,
+        '%s - "%s %s HTTP/%s" %d',
+        ("127.0.0.1", "GET", "/health", "1.1", 200),
+        None,
+    )
+
+    assert log_filter.filter(httpx_health)
+    assert log_filter.filter(uvicorn_health)

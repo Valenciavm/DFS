@@ -170,11 +170,19 @@ class BlockServiceImpl(pb2_grpc.BlockServiceServicer):
         self, request: pb2.HealthRequest, context: grpc.aio.ServicerContext
     ) -> pb2.HealthResponse:
         total, used = self.storage.get_disk_usage()
+        free = max(0, total - used)
+        block_count = self.storage.count_blocks()
+        logger.info(
+            "[DataNode %s] Health OK: free=%d bytes, blocks=%d",
+            self.dn.node_id,
+            free,
+            block_count,
+        )
         return pb2.HealthResponse(
             node_id=self.dn.node_id,
             status="ok",
-            free_bytes=max(0, total - used),
-            total_blocks=self.storage.count_blocks(),
+            free_bytes=free,
+            total_blocks=block_count,
         )
 
     async def WriteBlock(

@@ -40,15 +40,15 @@ docker compose up --build -d
 docker compose ps
 curl --fail http://localhost:8001/health
 curl --fail http://localhost:8002/health
-docker compose exec -T client python scripts/smoke_test.py
+docker compose exec -T client python -m scripts.smoke_test
 ```
 
 The smoke test logs in with `ADMIN_USER`/`ADMIN_PASSWORD`, uploads a file larger
 than one demo block, downloads it, and compares the bytes and SHA-256 checksum.
 To use the CLI interactively:
 
-```powershell
-docker compose exec client python -m client.cli --username demo-admin ls /
+```sh
+docker compose exec client python -m client.cli --username demo-admin ls /users/demo-admin
 docker compose exec client python -m client.cli --username demo-admin stat /users/demo-admin/compose-smoke.bin
 ```
 

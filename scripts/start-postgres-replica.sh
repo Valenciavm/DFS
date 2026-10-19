@@ -9,6 +9,8 @@ set -eu
 : "${REPLICATION_PASSWORD:?REPLICATION_PASSWORD is required}"
 : "${PGDATA:=/var/lib/postgresql/data}"
 
+chmod 0700 "$PGDATA"
+
 if [ ! -s "$PGDATA/PG_VERSION" ]; then
   passfile="$(mktemp)"
   trap 'rm -f "$passfile"' EXIT HUP INT TERM

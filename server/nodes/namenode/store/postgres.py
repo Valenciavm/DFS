@@ -356,6 +356,7 @@ class PostgresMetadataStore(MetadataStore):
             )
 
         for row in file_rows:
+            persisted_status = FileStatus(row["status"])
             file = FileMetadata(
                 file_id=row["file_id_key"],
                 name=row["name"],
@@ -363,7 +364,7 @@ class PostgresMetadataStore(MetadataStore):
                 size_bytes=row["size_bytes"],
                 block_size=row["block_size"],
                 replication=row["replication"],
-                status=FileStatus(row["status"]),
+                status=FileStatus.PENDING,
                 checksum=row["checksum"],
                 created_at=_from_timestamp(row["created_at"]) or 0,
                 modified_at=_from_timestamp(row["modified_at"]) or 0,
@@ -371,19 +372,23 @@ class PostgresMetadataStore(MetadataStore):
                 blocks=blocks_by_file.get(row["file_id"], []),
             )
             path = paths[row["inode_id"]]
-            if file.status is FileStatus.ABORTED and by_id[row["inode_id"]]["kind"] == "dir":
+            if (
+                persisted_status is FileStatus.ABORTED
+                and by_id[row["inode_id"]]["kind"] == "dir"
+            ):
                 parent_path = join_path(split_path(path)[:-1])
                 parent = snapshot.resolve_dir(parent_path)
                 snapshot._files[file.file_id] = file
+                file.status = FileStatus.ABORTED
                 snapshot._file_dir[file.file_id] = parent
                 for block in file.blocks:
                     snapshot._blocks[block.block_id] = block
                     snapshot._block_file[block.block_id] = file.file_id
                 continue
             snapshot.create_pending_file(path, file)
-            if file.status is FileStatus.COMMITTED:
+            if persisted_status is FileStatus.COMMITTED:
                 snapshot.commit_file(file.file_id, file.modified_at)
-            elif file.status is FileStatus.ABORTED:
+            elif persisted_status is FileStatus.ABORTED:
                 snapshot.abort_file(file.file_id, file.modified_at)
         self._cache = snapshot
         return snapshot

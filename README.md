@@ -1,25 +1,28 @@
 # DFSha
 
 > [!IMPORTANT]
-> **Technical Report:** The main document of the project's technical report is available at [DFS_Informe_Tecnico.pdf](DFSha_Informe_Tecnico_v1.0.pdf).
+> **Informe técnico:** [DFSha_Informe_Tecnico_v1.0.pdf](DFSha_Informe_Tecnico_v1.0.pdf).
 
-DFSha is a block-based distributed file system with NameNode metadata services,
-DataNode block storage, and a Python client. See [the architecture](docs/ARCHITECTURE.md),
-[the API contract](docs/API.md), and [issue 09](docs/issues/09-docker-compose-and-cloud-deploy.md).
+DFSha es un sistema de archivos distribuido por bloques. Incluye servicios
+NameNode para metadatos, DataNodes para almacenar bloques y un cliente Python
+con biblioteca y CLI interactivo. Consulta también la
+[arquitectura](docs/ARCHITECTURE.md), el [contrato de API](docs/API.md) y la
+[guía de despliegue](docs/issues/09-docker-compose-and-cloud-deploy.md).
 
-## Local development demo
+## Demo local con Docker
 
-> **Development only, not secure.** This Compose stack uses HTTP, insecure gRPC,
-> demo credentials, and does not encrypt DataNode files at rest. Do not expose it
-> to an untrusted network. The missing TLS/mTLS and AES-256-GCM controls are tracked
-> in [issue 07](docs/issues/07-security-tls-and-encryption.md); this Compose setup
-> does not close that issue or qualify for production/cloud deployment.
+> **Solo desarrollo; no es seguro para producción.** Esta configuración usa
+> HTTP, gRPC sin TLS, credenciales de demostración y no cifra los archivos de
+> los DataNodes en disco. No la expongas a redes no confiables. TLS/mTLS,
+> cifrado AES-256-GCM y failover automático de PostgreSQL siguen pendientes;
+> consulta [issue 07](docs/issues/07-security-tls-and-encryption.md).
 
-Prerequisites: Docker with the Compose plugin, and Python 3.13 if running
-the client from the host. The Compose client container already has the pinned
-dependencies installed.
+### 1. Requisitos y arranque
 
-From PowerShell:
+Necesitas Docker Desktop o Docker Engine con el plugin `docker compose`.
+Los comandos siguientes se ejecutan desde la raíz del repositorio.
+
+En PowerShell:
 
 ```powershell
 Copy-Item .env.example .env
@@ -28,10 +31,9 @@ docker compose up --build -d
 docker compose ps
 Invoke-RestMethod http://localhost:8001/health
 Invoke-RestMethod http://localhost:8002/health
-docker compose exec client python scripts/smoke_test.py
 ```
 
-From a POSIX shell:
+En Linux, macOS, WSL o Git Bash:
 
 ```sh
 cp .env.example .env
@@ -40,51 +42,170 @@ docker compose up --build -d
 docker compose ps
 curl --fail http://localhost:8001/health
 curl --fail http://localhost:8002/health
+```
+
+Espera a que los servicios aparezcan como `running`/`healthy` en
+`docker compose ps`. La primera construcción descarga imágenes y puede tardar.
+La cuenta de demostración configurada en `.env.example` es
+`demo-admin`; su contraseña es `local-demo-password-do-not-use`. En la demo
+local no hace falta cambiar esos valores. **No uses estas credenciales fuera
+de esta demo.** Si cambias `ADMIN_USER` o `ADMIN_PASSWORD` en `.env`, usa los
+nuevos valores en los ejemplos de esta guía.
+
+Para comprobar de inmediato una carga y descarga de más de un bloque:
+
+```sh
 docker compose exec -T client python -m scripts.smoke_test
 ```
 
-The smoke test logs in with `ADMIN_USER`/`ADMIN_PASSWORD`, uploads a file larger
-than one demo block, downloads it, and compares the bytes and SHA-256 checksum.
-To open the interactive client, first copy any local files you want to upload
-into the client container, then start a TTY session:
+El smoke test autentica con las variables de `.env`, sube y descarga un archivo,
+y comprueba que los bytes y el SHA-256 coincidan.
+
+### 2. Iniciar el CLI interactivo
+
+Abre una terminal con TTY desde la raíz del repositorio:
 
 ```sh
-# Replace this path with a file that actually exists on your machine.
-docker compose cp ./mi-archivo.txt client:/tmp/mi-archivo.txt
 docker compose exec -it client python -m client.cli --username demo-admin shell
 ```
 
-The CLI asks for the password once when the session starts, then reuses the
-authenticated client until `exit` or `logout`. On POSIX terminals, the built-in
-line editor supports arrow keys, cursor movement, and command history; on
-Windows, input uses the standard terminal prompt. Within the prompt, use
-familiar commands such as `pwd`, `ls`, `cd`,
-`mkdir`, `touch`, `put`, `get`, `mv`, `rm`, `rmdir`, and `share`; relative
-DFSha paths follow the current directory. For example:
+Escribe la contraseña cuando aparezca el prompt. La sesión queda autenticada
+hasta que escribas `logout` o `exit`; no se vuelve a pedir por cada operación.
+En la sesión, escribe `help` para ver la ayuda y `exit` para salir. Los paths
+remotos relativos se resuelven desde el directorio que muestra el prompt.
+`cd` cambia ese directorio; `cd` sin argumento vuelve al home del usuario.
 
-```text
-dfsha:/users/demo-admin$ mkdir proyectos
-dfsha:/users/demo-admin$ cd proyectos
-dfsha:/users/demo-admin/proyectos$ pwd
-dfsha:/users/demo-admin/proyectos$ touch vacio.txt
-dfsha:/users/demo-admin/proyectos$ put /tmp/mi-archivo.txt mi-archivo.txt
-dfsha:/users/demo-admin/proyectos$ ls
-dfsha:/users/demo-admin/proyectos$ share mi-archivo.txt user:bruno r
-dfsha:/users/demo-admin/proyectos$ get mi-archivo.txt /tmp/descargado.txt
-dfsha:/users/demo-admin/proyectos$ exit
+### 3. Probar los comandos del CLI
+
+`put` necesita que el archivo local exista dentro del contenedor `client`.
+Para crear un archivo de prueba en el directorio `/tmp` del contenedor, ejecuta
+en otra terminal:
+
+```sh
+docker compose exec -T client python -c "from pathlib import Path; Path('/tmp/demo.txt').write_text('archivo de prueba DFSha\n')"
 ```
 
-The commands also remain available as one-shot invocations, for example:
+Ahora ejecuta esta secuencia dentro del prompt `dfsha:...$`:
+
+```text
+help
+pwd
+ls
+mkdir -p practica
+cd practica
+touch vacio.txt
+stat vacio.txt
+put /tmp/demo.txt subida.txt
+ls
+get subida.txt /tmp/descargado.txt
+mv subida.txt renombrado.txt
+acl renombrado.txt
+group equipo --create
+group equipo --add demo-admin
+group equipo
+acl renombrado.txt group:equipo rw
+share renombrado.txt group:equipo r
+lock renombrado.txt --mode shared --ttl 60
+```
+
+`lock` imprime un objeto JSON con un `lock_id`. Copia ese valor y úsalo para
+liberar el lock:
+
+```text
+unlock PEGA_AQUI_EL_LOCK_ID
+```
+
+Continúa la prueba y limpia los archivos/directorios remotos:
+
+```text
+rm vacio.txt
+rm renombrado.txt
+cd ..
+rmdir practica
+exit
+```
+
+El archivo descargado está en `/tmp/descargado.txt` dentro del contenedor. Para
+copiarlo de vuelta al directorio actual del host, ya fuera del CLI:
+
+```sh
+docker compose cp client:/tmp/descargado.txt ./descargado.txt
+```
+
+En PowerShell, crea el archivo de prueba en tu equipo y cópialo al contenedor
+con una ruta que exista:
+
+```powershell
+Set-Content -NoNewline .\demo.txt "archivo de prueba DFSha"
+docker compose cp .\demo.txt client:/tmp/demo.txt
+```
+
+Después de `exit`, recupera la descarga con:
+
+```powershell
+docker compose cp client:/tmp/descargado.txt .\descargado.txt
+```
+
+### 4. Referencia rápida de comandos
+
+Estos comandos se escriben dentro de la sesión interactiva. Los argumentos
+entre corchetes son opcionales; `LOCAL` es una ruta del contenedor y `REMOTO`
+una ruta del sistema DFSha.
+
+| Comando | Qué hace | Ejemplo |
+| --- | --- | --- |
+| `help`, `exit` (`quit`) | Muestra ayuda; termina la sesión. | `help` |
+| `login`, `logout` | Inicia o termina la autenticación de la sesión. `login` vuelve a pedir usuario y contraseña. | `logout` y luego `login` |
+| `pwd`, `ls [RUTA]`, `cd [RUTA]` | Muestra directorio, lista entradas y navega. `cd` sin ruta vuelve al home. | `ls`, `cd practica` |
+| `stat RUTA` | Muestra metadatos de archivo o directorio. | `stat informe.txt` |
+| `mkdir [-p] RUTA` | Crea un directorio; `-p` crea también los padres. | `mkdir -p proyectos/dfs` |
+| `touch RUTA` | Crea un archivo remoto vacío. | `touch vacio.txt` |
+| `rmdir [-r] RUTA` | Elimina un directorio vacío; `-r` permite eliminarlo recursivamente. | `rmdir proyectos` |
+| `rm RUTA` | Elimina un archivo remoto. | `rm vacio.txt` |
+| `mv ORIGEN DESTINO` | Mueve o renombra una ruta remota. | `mv viejo.txt nuevo.txt` |
+| `put LOCAL REMOTO [--overwrite]` | Sube un archivo desde el contenedor cliente. | `put /tmp/demo.txt demo.txt` |
+| `get REMOTO LOCAL` | Descarga un archivo al contenedor cliente. | `get demo.txt /tmp/demo.txt` |
+| `acl RUTA` | Consulta la ACL. | `acl informe.txt` |
+| `acl RUTA SUJETO PERMISO` | Actualiza la ACL. Permisos: `r`, `rw`, `none`. | `acl informe.txt user:ana r` |
+| `share RUTA SUJETO PERMISO` | Alias para conceder o revocar acceso mediante ACL. | `share informe.txt group:equipo rw` |
+| `lock RUTA [--mode shared\|exclusive] [--ttl SEGUNDOS]` | Adquiere un lock; guarda el `lock_id` que devuelve. | `lock informe.txt --mode exclusive --ttl 60` |
+| `unlock LOCK_ID` | Libera el lock indicado. | `unlock ID_COPIADO` |
+| `group NOMBRE --create` | Crea un grupo. | `group equipo --create` |
+| `group NOMBRE [--add USUARIOS...] [--remove USUARIOS...]` | Consulta un grupo o modifica sus miembros. Los usuarios deben existir. | `group equipo --add demo-admin` |
+| `apikey create [NOMBRE]` | Crea una API key; guarda el secreto mostrado porque no se vuelve a mostrar. | `apikey create laptop` |
+| `apikey list` | Lista las API keys y sus identificadores. | `apikey list` |
+| `apikey revoke KEY_ID` | Revoca una API key por su identificador. | `apikey revoke ID_COPIADO` |
+
+Los comandos de transferencia distinguen entre el disco del host y el del
+contenedor: `put` lee el archivo dentro de `client`; `get` escribe allí.
+`docker compose cp` sirve para mover archivos entre ambos. `touch` crea un
+archivo vacío nuevo; para reemplazar un archivo al subirlo, usa `put ... --overwrite`.
+El CLI no ofrece escritura aleatoria en sitio: el modelo de escritura es WORM,
+es decir, reemplazar el archivo completo.
+
+Para probar los comandos administrativos, usa `group equipo --create` antes de
+añadir miembros o asignar permisos al grupo. La demo solo crea automáticamente
+el usuario administrador; `group ... --add` requiere que cada usuario ya exista.
+`apikey create` enseña el secreto al crearlo: no lo compartas ni lo pegues en
+repositorios.
+
+### 5. Ejecutar un comando sin abrir el shell
+
+También puedes ejecutar un comando en un proceso separado. Pon las opciones
+globales antes del comando:
 
 ```sh
 docker compose exec client python -m client.cli --username demo-admin ls /users/demo-admin
-docker compose exec client python -m client.cli --username demo-admin stat /users/demo-admin/compose-smoke.bin
+docker compose exec client python -m client.cli --username demo-admin mkdir /users/demo-admin/prueba
 ```
 
-These examples use the `.env.example` username; replace `demo-admin` if
-`ADMIN_USER` was changed in `.env`.
+Cada proceso solicita la contraseña de nuevo. Para no repetir el login en cada
+operación, usa el modo `shell`. También se puede autenticar con una API key
+usando la opción global `--api-key` antes del comando.
 
-The Python library also provides ranged read-only access to large files:
+## Biblioteca Python
+
+El cliente también ofrece lectura por rangos y escritura WORM secuencial:
 
 ```python
 from client import DFShaClient
@@ -92,70 +213,58 @@ from client import DFShaClient
 client = DFShaClient("http://namenode1:8000")
 try:
     client.login("demo-admin", password)
-    with client.open("/users/demo-admin/mi-archivo.txt", lock="shared") as remote_file:
+    with client.open("/users/demo-admin/archivo.txt", lock="shared") as remote_file:
         remote_file.seek(1024)
         data = remote_file.read(256)
+
+    with client.open("/users/demo-admin/generado.bin", "wb") as remote_file:
+        remote_file.write(b"primera parte")
+        remote_file.write(b" y segunda parte")
 finally:
     client.http.close()
 ```
 
-For sequential WORM creation or replacement, open in binary write mode; bytes
-are staged locally and uploaded when the handle closes:
+`open()` en modo lectura obtiene solo los rangos solicitados. `open(..., "wb")`
+guarda los bytes temporalmente y sube una versión completa al cerrar. No se
+admiten modificaciones aleatorias en sitio. Para subir o bajar un archivo local
+completo se pueden usar `put_file()` y `get_file()`.
 
-```python
-with client.open("/users/demo-admin/generated.bin", "wb") as remote_file:
-    remote_file.write(b"first part")
-    remote_file.write(b" and second part")
-```
+## Topología, logs y apagado
 
-Remote files do not support random in-place updates. `open()` reads by range and
-`open(..., "wb")` writes a new complete version on close; use `put_file()` for
-whole local files.
-
-The demo uses 1 MiB blocks, replication factor 3 and a two-replica commit
-quorum, with five DataNodes on the private Compose network. Their advertised
-addresses use Compose DNS names, so run the client inside the `client` service.
-Each DataNode and each PostgreSQL instance has a separate named volume. Inspect
-DataNode placement and replication through the API/admin endpoints and logs:
+La demo usa bloques de 1 MiB, factor de replicación 3, quorum de escritura de
+dos réplicas y cinco DataNodes. Los servicios comparten una red privada de
+Compose; por eso conviene ejecutar el cliente dentro del servicio `client`.
+Para inspeccionar los logs:
 
 ```sh
 docker compose logs --follow namenode1 namenode2 datanode1 datanode2 datanode3 datanode4 datanode5
 ```
 
-To demonstrate failure handling, stop one DataNode after the smoke test:
+Se puede probar la detección de una caída deteniendo un DataNode:
 
 ```sh
 docker compose stop datanode1
 docker compose logs --follow namenode1 namenode2
+docker compose start datanode1
 ```
 
-Restore it with `docker compose start datanode1`. Allow the NameNode liveness and
-replication loops to detect the failure and schedule repair. The local topology
-does not configure TLS; do not infer production failover or security from this demo.
+La detección y reparación toman tiempo. PostgreSQL tiene una réplica hot-standby,
+pero ambos NameNodes se conectan al primario: la promoción automática y el
+cambio de DSN no están implementados. La promoción manual está documentada en
+[issue 09](docs/issues/09-docker-compose-and-cloud-deploy.md).
 
-PostgreSQL primary data streams to a hot-standby replica. Both NameNodes currently
-connect to the primary DSN; automatic promotion and DSN reconfiguration are not
-implemented. Stop both NameNodes before a manual replica promotion:
+Para apagar la demo conservando los datos:
 
 ```sh
-docker compose stop namenode1 namenode2
-./scripts/promote-postgres-replica.sh
+docker compose down
 ```
 
-PowerShell:
+**No ejecutes `docker compose down -v` si quieres conservar el estado:** ese
+comando elimina los volúmenes con datos de PostgreSQL y de los bloques.
 
-```powershell
-docker compose stop namenode1 namenode2
-.\scripts\promote-postgres-replica.ps1
-```
+## Pruebas y lint
 
-Promotion is an operator action and does not automatically point Compose at the
-new primary. Update `POSTGRES_PRIMARY_DSN` in `.env` and recreate both NameNodes
-before resuming the demo. Do not remove volumes if the demo data must be retained.
-For a fresh disposable cluster, `docker compose down -v` deletes all database and
-block data.
-
-## Tests and lint
+Con Python 3.13 y las dependencias instaladas en el entorno local:
 
 ```sh
 python -m pytest -q
@@ -163,14 +272,34 @@ python -m ruff check client scripts/smoke_test.py server/nodes/namenode/api/rout
 python -m unittest discover -s client/tests
 ```
 
-The repository-wide `python -m ruff check .` currently reports 23 diagnostics
-in existing server and test files; the command above covers the client/API files
-changed for this integration and is clean.
+`POSTGRES_TEST_DSN` es una variable de entorno **solo para las pruebas de
+integración PostgreSQL**; no es necesaria para arrancar la demo ni para usar el
+CLI. Si no está definida, las pruebas que requieren una base PostgreSQL real
+se marcan como omitidas. Si quieres ejecutarlas, configura la variable para
+que apunte a una base de datos de pruebas desechable. El usuario de esa base
+debe poder crear y eliminar esquemas; los tests crean un esquema aislado y lo
+eliminan al finalizar. No apuntes esta variable a una base de datos de
+producción.
 
-## Security and deployment status
+En PowerShell, define la variable solo para esa terminal y luego quítala:
 
-The Compose profile is an integration/dev harness only. HTTP/gRPC TLS, mTLS,
-AES-256-GCM storage encryption, cloud firewall rules, and automated PostgreSQL
-failover remain open work. See [the security issue](docs/issues/07-security-tls-and-encryption.md)
-and [the deployment issue](docs/issues/09-docker-compose-and-cloud-deploy.md)
-before planning any non-local deployment.
+```powershell
+$env:POSTGRES_TEST_DSN = "postgresql://usuario:contrasena@localhost:5432/dfsha_test"
+python -m pytest -q
+Remove-Item Env:POSTGRES_TEST_DSN
+```
+
+En Linux, macOS o WSL:
+
+```sh
+POSTGRES_TEST_DSN="postgresql://usuario:contrasena@localhost:5432/dfsha_test" python -m pytest -q
+```
+
+## Seguridad y despliegue
+
+La configuración de Compose es un entorno de integración local, no una
+instalación de producción. TLS para HTTP/gRPC, mTLS, cifrado AES-256-GCM,
+reglas de firewall cloud y failover automático de PostgreSQL siguen pendientes.
+Revisa [issue 07](docs/issues/07-security-tls-and-encryption.md) y
+[issue 09](docs/issues/09-docker-compose-and-cloud-deploy.md) antes de planear
+un despliegue fuera de la máquina local.

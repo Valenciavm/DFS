@@ -69,10 +69,11 @@ Abre una terminal con TTY desde la raíz del repositorio:
 docker compose exec -it client python -m client.cli --username demo-admin shell
 ```
 
-Escribe la contraseña cuando aparezca el prompt. La sesión queda autenticada
+Escribe la contraseña cuando el CLI la solicite. La sesión queda autenticada
 hasta que escribas `logout` o `exit`; no se vuelve a pedir por cada operación.
-En la sesión, escribe `help` para ver la ayuda y `exit` para salir. Los paths
-remotos relativos se resuelven desde el directorio que muestra el prompt.
+En la sesión, escribe `help` para ver la ayuda y `exit` para salir. Las rutas
+remotas relativas se resuelven desde el directorio que aparece en el indicador
+de la consola (por ejemplo, `dfsha:/users/demo-admin$`).
 `cd` cambia ese directorio; `cd` sin argumento vuelve al home del usuario.
 
 ### 3. Probar los comandos del CLI
@@ -85,7 +86,8 @@ en otra terminal:
 docker compose exec -T client python -c "from pathlib import Path; Path('/tmp/demo.txt').write_text('archivo de prueba DFSha\n')"
 ```
 
-Ahora ejecuta esta secuencia dentro del prompt `dfsha:...$`:
+Ahora ejecuta esta secuencia dentro de la sesión interactiva, después del
+indicador `dfsha:...$`:
 
 ```text
 help
@@ -153,7 +155,7 @@ docker compose cp client:/tmp/descargado.txt .\descargado.txt
 ```
 
 Para probar la autenticación y las API keys, vuelve a abrir el shell y ejecuta
-estos comandos en el prompt interactivo:
+estos comandos en la sesión interactiva:
 
 ```text
 apikey create clave-de-prueba

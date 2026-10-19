@@ -150,7 +150,8 @@ issue 06 proves service-level takeover.
 
 ## Acceptance checklist
 
-- [x] `PostgresMetadataStore` implements every method in `MetadataStore`.
+- [x] `PostgresMetadataStore` implements every method in the current
+  `MetadataStore` contract, including `mv` added on `main`.
 - [x] Numbered migrations create the complete schema and indexes.
 - [x] Auth, group, ACL, lock, audit and lease rows are represented.
 - [x] No DataNode liveness/replica-location table is introduced.

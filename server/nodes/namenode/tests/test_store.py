@@ -308,6 +308,70 @@ class TestRemoval:
         assert code_of(lambda: store.remove_dir("/users", True, T0)) is ErrorCode.BAD_REQUEST
 
 
+class TestMove:
+    def test_move_file_updates_its_path_and_timestamp(self, store):
+        store.mkdir("/users/ana/dest", "ana", T0)
+        store.create_pending_file("/users/ana/source", a_file("source"))
+        store.commit_file("f1", T0)
+
+        moved = store.mv("/users/ana/source", "/users/ana/dest/renamed", T0 + 5)
+
+        assert moved.file_id == "f1"
+        assert moved.name == "renamed"
+        assert moved.modified_at == T0 + 5
+        assert store.get_file("/users/ana/source") is None
+        assert store.get_file("/users/ana/dest/renamed").file_id == "f1"
+        assert store.path_of("f1") == "/users/ana/dest/renamed"
+
+    def test_move_directory_updates_descendant_and_pending_upload_paths(self, store):
+        store.mkdir("/users/ana/source/nested", "ana", T0, parents=True)
+        store.mkdir("/users/ana/destination", "ana", T0)
+        store.create_pending_file(
+            "/users/ana/source/nested/pending",
+            a_file("pending", file_id="pending"),
+        )
+        store.create_pending_file(
+            "/users/ana/source/nested/committed",
+            a_file("committed", file_id="committed"),
+        )
+        store.commit_file("committed", T0)
+
+        moved = store.mv(
+            "/users/ana/source", "/users/ana/destination/moved", T0 + 5
+        )
+
+        assert moved.path() == "/users/ana/destination/moved"
+        assert store.path_of("committed") == (
+            "/users/ana/destination/moved/nested/committed"
+        )
+        assert store.get_pending(
+            "/users/ana/destination/moved/nested/pending"
+        ).file_id == "pending"
+        store.commit_file("pending", T0 + 6)
+        assert store.get_file(
+            "/users/ana/destination/moved/nested/pending"
+        ).file_id == "pending"
+
+    def test_move_rejects_descendants_and_existing_destinations(self, store):
+        store.mkdir("/users/ana/source/child", "ana", T0, parents=True)
+        store.mkdir("/users/ana/occupied", "ana", T0)
+
+        assert (
+            code_of(
+                lambda: store.mv(
+                    "/users/ana/source", "/users/ana/source/child/moved", T0
+                )
+            )
+            is ErrorCode.BAD_REQUEST
+        )
+        assert (
+            code_of(
+                lambda: store.mv("/users/ana/source", "/users/ana/occupied", T0)
+            )
+            is ErrorCode.ALREADY_EXISTS
+        )
+
+
 class TestSnapshots:
     def test_files_filters_by_status(self, store):
         store.create_pending_file("/users/ana/p", a_file("p", file_id="fp"))

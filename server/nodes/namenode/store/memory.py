@@ -200,6 +200,11 @@ class InMemoryMetadataStore(MetadataStore):
             dst_parent.children[dst_name] = directory
             src_parent.modified_at = now
             dst_parent.modified_at = now
+            for pending_path, file_id in tuple(self._pending.items()):
+                if pending_path.startswith(src_canonical + "/"):
+                    suffix = pending_path[len(src_canonical):]
+                    del self._pending[pending_path]
+                    self._pending[dst_canonical + suffix] = file_id
             return directory
 
         raise DfshaError(ErrorCode.FILE_NOT_FOUND, f"{src_canonical} does not exist")

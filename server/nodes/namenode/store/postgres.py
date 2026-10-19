@@ -477,6 +477,82 @@ class PostgresMetadataStore(MetadataStore):
 
         return self._mutate(delete)
 
+    def mv(
+        self, src: str, dst: str, now: float
+    ) -> FileMetadata | DirectoryMetadata:
+        src_segments = split_path(src)
+        dst_segments = split_path(dst)
+        if not src_segments:
+            raise DfshaError(ErrorCode.BAD_REQUEST, "cannot move root directory")
+        if not dst_segments:
+            raise DfshaError(ErrorCode.BAD_REQUEST, "cannot move to root directory")
+
+        src_canonical = join_path(src_segments)
+        dst_canonical = join_path(dst_segments)
+        if src_canonical == dst_canonical:
+            node = self._cache.stat(src_canonical)
+            if node is None:
+                raise DfshaError(
+                    ErrorCode.FILE_NOT_FOUND, f"{src_canonical} does not exist"
+                )
+            return node
+        if dst_canonical.startswith(src_canonical + "/"):
+            raise DfshaError(
+                ErrorCode.BAD_REQUEST,
+                f"cannot move directory into itself: {dst_canonical}",
+            )
+
+        src_parent_path = join_path(src_segments[:-1])
+        dst_parent_path = join_path(dst_segments[:-1])
+        src_name = src_segments[-1]
+        dst_name = dst_segments[-1]
+
+        def move(connection: Connection[Row]) -> None:
+            src_parent_id = self._inode_id(
+                connection, path=src_parent_path, require_directory=True
+            )
+            dst_parent_id = self._inode_id(
+                connection, path=dst_parent_path, require_directory=True
+            )
+            source = connection.execute(
+                """
+                SELECT id, kind, current_file_id FROM inodes
+                WHERE parent_id = %s AND name = %s FOR UPDATE
+                """,
+                (src_parent_id, src_name),
+            ).fetchone()
+            if source is None or (
+                source["kind"] == "file" and source["current_file_id"] is None
+            ):
+                raise DfshaError(
+                    ErrorCode.FILE_NOT_FOUND, f"{src_canonical} does not exist"
+                )
+            destination = connection.execute(
+                "SELECT id FROM inodes WHERE parent_id = %s AND name = %s FOR UPDATE",
+                (dst_parent_id, dst_name),
+            ).fetchone()
+            if destination is not None:
+                raise DfshaError(
+                    ErrorCode.ALREADY_EXISTS, f"{dst_canonical} already exists"
+                )
+            connection.execute(
+                """
+                UPDATE inodes SET parent_id = %s, name = %s, modified_at = %s
+                WHERE id = %s
+                """,
+                (dst_parent_id, dst_name, _to_timestamp(now), source["id"]),
+            )
+            connection.execute(
+                "UPDATE inodes SET modified_at = %s WHERE id = ANY(%s)",
+                (_to_timestamp(now), [src_parent_id, dst_parent_id]),
+            )
+
+        self._mutate(move)
+        moved = self._cache.stat(dst_canonical)
+        if moved is None:
+            raise RuntimeError(f"moved path {dst_canonical} missing from metadata snapshot")
+        return moved
+
     def get_pending(self, path: str) -> FileMetadata | None:
         return self._cache.get_pending(path)
 

@@ -96,6 +96,7 @@ cd practica
 touch vacio.txt
 stat vacio.txt
 put /tmp/demo.txt subida.txt
+put /tmp/demo.txt subida.txt --overwrite
 ls
 get subida.txt /tmp/descargado.txt
 mv subida.txt renombrado.txt
@@ -103,9 +104,11 @@ acl renombrado.txt
 group equipo --create
 group equipo --add demo-admin
 group equipo
+group equipo --remove demo-admin
+group equipo --add demo-admin
 acl renombrado.txt group:equipo rw
 share renombrado.txt group:equipo r
-lock renombrado.txt --mode shared --ttl 60
+lock renombrado.txt --mode exclusive --ttl 60
 ```
 
 `lock` imprime un objeto JSON con un `lock_id`. Copia ese valor y úsalo para
@@ -122,6 +125,9 @@ rm vacio.txt
 rm renombrado.txt
 cd ..
 rmdir practica
+mkdir -p temporal/subdirectorio
+touch temporal/subdirectorio/archivo.txt
+rmdir -r temporal
 exit
 ```
 
@@ -145,6 +151,22 @@ Después de `exit`, recupera la descarga con:
 ```powershell
 docker compose cp client:/tmp/descargado.txt .\descargado.txt
 ```
+
+Para probar la autenticación y las API keys, vuelve a abrir el shell y ejecuta
+estos comandos en el prompt interactivo:
+
+```text
+apikey create clave-de-prueba
+apikey list
+apikey revoke PEGA_AQUI_EL_KEY_ID
+logout
+login
+```
+
+`apikey create` devuelve un identificador y un secreto: usa el identificador
+para revocar la clave y guarda el secreto solo si quieres probar una sesión
+con `--api-key`. Al escribir `login`, el CLI vuelve a pedir usuario y
+contraseña.
 
 ### 4. Referencia rápida de comandos
 

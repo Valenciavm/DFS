@@ -1,110 +1,116 @@
 # DFSha
 
-DFSha es un prototipo de sistema de archivos distribuido por bloques, inspirado
-en HDFS. Separa el plano de control (NameNode y metadatos) del plano de datos
-(DataNodes y bloques), con una API REST para operaciones de metadatos y gRPC
-para transferir bloques.
+DFSha is a block-based distributed file system with NameNode metadata services,
+DataNode block storage, and a Python client. See [the architecture](docs/ARCHITECTURE.md),
+[the API contract](docs/API.md), and [issue 09](docs/issues/09-docker-compose-and-cloud-deploy.md).
 
-> **Estado de `main`:** esta rama contiene el núcleo del NameNode, una API REST
-> FastAPI y un servicio gRPC de DataNode. Todavía no es un despliegue completo:
-> no incluye cliente/CLI de usuario, almacenamiento PostgreSQL, TLS/mTLS,
-> cifrado de bloques en reposo ni Docker Compose. Consulta
-> [la issue 09](docs/issues/09-docker-compose-and-cloud-deploy.md) para el
-> alcance pendiente de despliegue; no asumas que sus pasos ya funcionan.
+## Local development demo
 
-## Componentes actuales
+> **Development only, not secure.** This Compose stack uses HTTP, insecure gRPC,
+> demo credentials, and does not encrypt DataNode files at rest. Do not expose it
+> to an untrusted network. The missing TLS/mTLS and AES-256-GCM controls are tracked
+> in [issue 07](docs/issues/07-security-tls-and-encryption.md); this Compose setup
+> does not close that issue or qualify for production/cloud deployment.
 
-| Componente | Estado en `main` |
-|---|---|
-| NameNode | Núcleo de metadatos en memoria, autenticación y ACL, planificación de bloques y API REST. |
-| DataNode | Almacenamiento local de bloques y servicio gRPC; incluye transferencias en pipeline, lecturas por rango y validación de block tokens. |
-| Cliente | No hay todavía una biblioteca de cliente ni una CLI de usuario implementadas. |
-| Persistencia | El `MetadataStore` disponible es en memoria; PostgreSQL no está integrado. |
-| Despliegue | No hay `docker-compose.yml`, imágenes ni guía de despliegue cloud. |
-| Seguridad de transporte y almacenamiento | TLS/mTLS y cifrado de bloques en reposo están pendientes. Los block tokens y la autenticación de usuarios sí forman parte del código actual. |
+Prerequisites: Docker Desktop with the Compose plugin, and Python 3.13 if running
+the client from the host. The Compose client container already has the pinned
+dependencies installed.
 
-Para el diseño y los contratos, consulta [Arquitectura](docs/ARCHITECTURE.md),
-[API](docs/API.md), [modelos del NameNode](docs/NAMENODE_MODELS.md) y
-[documentación del DataNode](docs/DATANODE.md).
-
-## Requisitos
-
-- Python 3.10 o posterior.
-- `pip`.
-
-El repositorio no declara una matriz de versiones de Python probadas. Las
-dependencias directas están fijadas en [requirements.txt](requirements.txt).
-
-## Preparar el entorno
-
-Desde la raíz del repositorio, en PowerShell:
+From PowerShell:
 
 ```powershell
-py -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+Copy-Item .env.example .env
+docker compose config
+docker compose up --build -d
+docker compose ps
+Invoke-RestMethod http://localhost:8001/health
+Invoke-RestMethod http://localhost:8002/health
+docker compose exec client python scripts/smoke_test.py
 ```
 
-En Linux o macOS:
+From a POSIX shell:
 
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+```sh
+cp .env.example .env
+docker compose config
+docker compose up --build -d
+docker compose ps
+curl --fail http://localhost:8001/health
+curl --fail http://localhost:8002/health
+docker compose exec -T client python scripts/smoke_test.py
 ```
 
-Los stubs gRPC se generan localmente a partir del contrato protobuf y no se
-guardan en Git:
+The smoke test logs in with `ADMIN_USER`/`ADMIN_PASSWORD`, uploads a file larger
+than one demo block, downloads it, and compares the bytes and SHA-256 checksum.
+To use the CLI interactively:
 
 ```powershell
-python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. proto/block_service.proto
+docker compose exec client python -m client.cli --username demo-admin ls /
+docker compose exec client python -m client.cli --username demo-admin stat /users/demo-admin/compose-smoke.bin
 ```
 
-Ejecuta ese comando desde la raíz del repositorio antes de iniciar o probar el
-DataNode.
+The commands above use the `.env.example` username; replace `demo-admin` if
+`ADMIN_USER` was changed in `.env`.
 
-## Pruebas y lint
+The demo uses 1 MiB blocks, replication factor 3 and a two-replica commit
+quorum, with five DataNodes on the private Compose network. Their advertised
+addresses use Compose DNS names, so run the client inside the `client` service.
+Each DataNode and each PostgreSQL instance has a separate named volume. Inspect
+DataNode placement and replication through the API/admin endpoints and logs:
+
+```sh
+docker compose logs --follow namenode1 namenode2 datanode1 datanode2 datanode3 datanode4 datanode5
+```
+
+To demonstrate failure handling, stop one DataNode after the smoke test:
+
+```sh
+docker compose stop datanode1
+docker compose logs --follow namenode1 namenode2
+```
+
+Restore it with `docker compose start datanode1`. Allow the NameNode liveness and
+replication loops to detect the failure and schedule repair. The local topology
+does not configure TLS; do not infer production failover or security from this demo.
+
+PostgreSQL primary data streams to a hot-standby replica. Both NameNodes currently
+connect to the primary DSN; automatic promotion and DSN reconfiguration are not
+implemented. Stop both NameNodes before a manual replica promotion:
+
+```sh
+docker compose stop namenode1 namenode2
+./scripts/promote-postgres-replica.sh
+```
+
+PowerShell:
 
 ```powershell
+docker compose stop namenode1 namenode2
+.\scripts\promote-postgres-replica.ps1
+```
+
+Promotion is an operator action and does not automatically point Compose at the
+new primary. Update `POSTGRES_PRIMARY_DSN` in `.env` and recreate both NameNodes
+before resuming the demo. Do not remove volumes if the demo data must be retained.
+For a fresh disposable cluster, `docker compose down -v` deletes all database and
+block data.
+
+## Tests and lint
+
+```sh
 python -m pytest -q
-python -m ruff check .
+python -m ruff check client scripts/smoke_test.py server/nodes/namenode/api/routes/files.py server/nodes/namenode/api/routes/groups.py server/nodes/namenode/api/schemas.py server/nodes/namenode/tests/test_api.py
+python -m unittest discover -s client/tests
 ```
 
-La suite de replicación de bloques puede ejecutarse de forma aislada:
+The repository-wide `python -m ruff check .` currently reports 23 diagnostics
+in existing server and test files; the command above covers the client/API files
+changed for this integration and is clean.
 
-```powershell
-python -m pytest tests/integration/test_block_replication.py -v
-```
+## Security and deployment status
 
-## Estado del arranque local
-
-El punto de entrada del NameNode es `python -m server.nodes.namenode` y el del
-DataNode es `python -m server.nodes.datanode`. El NameNode requiere al menos
-`BLOCK_TOKEN_SECRET` y `JWT_SECRET` en el entorno. Sin embargo, el arranque del
-servidor REST del NameNode no está verificado en esta revisión de `main`: el
-código usa `settings.namenode_host` y `settings.namenode_port`, pero esos
-atributos no están definidos en la configuración actual. Por eso este README
-no presenta todavía una secuencia local de clúster como demo reproducible.
-
-La ejecución completa de la issue 09 requiere además PostgreSQL primario y
-réplica, dos NameNodes, cinco DataNodes, configuración de secretos y
-certificados, scripts de comprobación y pruebas de humo. Esos archivos aún no
-están en `main`.
-
-## Issues y documentación
-
-- [Issues pendientes y roadmap](docs/issues/README.md)
-- [Plan de despliegue Docker Compose y cloud (issue 09)](docs/issues/09-docker-compose-and-cloud-deploy.md)
-- [Plan de pruebas final (issue 10)](docs/issues/10-test-plan-execution-and-report.md)
-- [Contrato REST y gRPC](docs/API.md)
-- [Servicio gRPC de bloques](docs/GRPC_BLOCK_SERVICE.md)
-
-## Seguridad
-
-No uses secretos de producción en desarrollo ni subas credenciales, claves,
-certificados privados o datos locales al repositorio. La configuración de
-transporte TLS/mTLS y el cifrado en reposo siguen pendientes; el estado
-implementado y las brechas conocidas están descritos en
-[DATANODE.md](docs/DATANODE.md) y en la [issue 07](docs/issues/07-security-tls-and-encryption.md).
+The Compose profile is an integration/dev harness only. HTTP/gRPC TLS, mTLS,
+AES-256-GCM storage encryption, cloud firewall rules, and automated PostgreSQL
+failover remain open work. See [the security issue](docs/issues/07-security-tls-and-encryption.md)
+and [the deployment issue](docs/issues/09-docker-compose-and-cloud-deploy.md)
+before planning any non-local deployment.

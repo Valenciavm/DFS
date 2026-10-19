@@ -83,8 +83,24 @@ class ClientTests(unittest.TestCase):
         self.client.unlock.assert_called_once_with("lock-1")
 
     def test_open_rejects_write_modes_for_worm_files(self):
-        with self.assertRaisesRegex(NotImplementedError, "WORM"):
-            self.client.open("file.txt", mode="wb")
+        with self.assertRaisesRegex(ValueError, "mode"):
+            self.client.open("file.txt", mode="ab")
+
+    def test_open_write_stages_file_until_close_and_supports_exclusive_lock(self):
+        self.client.lock = Mock(return_value={"lock_id": "lock-1"})
+        self.client.unlock = Mock()
+        self.client.put_file = Mock()
+
+        with self.client.open("file.txt", "wb", lock="exclusive") as remote_file:
+            remote_file.write(b"new contents")
+            self.client.put_file.assert_not_called()
+
+        self.client.lock.assert_called_once_with(
+            "/file.txt", mode="exclusive", ttl_s=60
+        )
+        self.client.put_file.assert_called_once()
+        self.assertEqual(self.client.put_file.call_args.args[1], "/file.txt")
+        self.client.unlock.assert_called_once_with("lock-1")
 
     def test_open_releases_lock_if_manifest_is_invalid(self):
         self.client.http.request.return_value = {"size": 5, "blocks": []}

@@ -12,7 +12,7 @@ from urllib.parse import quote
 import grpc
 
 from .exceptions import DFShaError, IntegrityError, MFARequired
-from .file import DFSFile
+from .file import DFSFile, DFSFileWriter
 from .http import NameNodeHTTP
 from .transfer import GrpcBlockTransport
 
@@ -578,21 +578,45 @@ class DFShaClient:
                 logger.exception("Unable to remove incomplete download %s", temp)
             raise
 
-    def open(self, remote_path, mode="rb", lock=None, lock_ttl_s=60):
-        """Open a read-only DFSha file handle; writes use WORM uploads via put_file."""
-        if mode != "rb":
-            raise NotImplementedError(
-                "DFSha files are WORM; open() supports 'rb' only. "
-                "Create or replace content with put_file()."
-            )
+    def open(
+        self,
+        remote_path,
+        mode="rb",
+        lock=None,
+        lock_ttl_s=60,
+        overwrite=False,
+    ):
+        """Open for ranged reads or sequential WORM writes."""
+        if mode not in {"rb", "wb"}:
+            raise ValueError("mode must be 'rb' or 'wb'")
         if lock not in {None, "shared", "exclusive"}:
             raise ValueError("lock must be None, 'shared', or 'exclusive'")
+        if mode == "wb" and lock == "shared":
+            raise ValueError("WORM writes require an exclusive lock, not a shared lock")
 
         remote = self.resolve_path(remote_path)
         lock_id = None
         if lock is not None:
             lock_response = self.lock(remote, mode=lock, ttl_s=lock_ttl_s)
             lock_id = lock_response["lock_id"]
+        if mode == "wb":
+            try:
+                return DFSFileWriter(
+                    self,
+                    remote,
+                    overwrite=overwrite,
+                    lock_id=lock_id,
+                )
+            except Exception:
+                if lock_id is not None:
+                    try:
+                        self.unlock(lock_id)
+                    except DFShaError:
+                        logger.exception(
+                            "Unable to release lock %s after write open failed",
+                            lock_id,
+                        )
+                raise
         try:
             manifest = self.http.request(
                 "GET",

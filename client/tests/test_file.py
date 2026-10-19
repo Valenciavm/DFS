@@ -3,7 +3,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from client.file import DFSFile
+from client.file import DFSFile, DFSFileWriter
 
 
 def manifest():
@@ -124,3 +124,57 @@ def test_inconsistent_manifest_and_negative_seek_fail_clearly():
     file = DFSFile(client, manifest())
     with pytest.raises(ValueError, match="negative"):
         file.seek(-1)
+
+
+def test_writer_uploads_sequential_bytes_on_close():
+    uploaded = []
+    client = SimpleNamespace(
+        put_file=lambda path, remote_path, overwrite: uploaded.append(
+            (path.read_bytes(), remote_path, overwrite)
+        ),
+        unlock=Mock(),
+    )
+    writer = DFSFileWriter(
+        client,
+        "/users/ana/new.bin",
+        overwrite=True,
+        lock_id="lock-1",
+    )
+    assert writer.write(b"first ") == 6
+    assert writer.write(memoryview(b"second")) == 6
+    assert writer.tell() == 12
+
+    writer.close()
+    writer.close()
+
+    assert uploaded == [(b"first second", "/users/ana/new.bin", True)]
+    client.unlock.assert_called_once_with("lock-1")
+    assert writer.closed
+    with pytest.raises(ValueError, match="closed"):
+        writer.write(b"late")
+
+
+def test_writer_aborts_staged_content_when_context_body_fails():
+    client = SimpleNamespace(put_file=Mock(), unlock=Mock())
+    writer = DFSFileWriter(client, "/users/ana/new.bin", lock_id="lock-1")
+    staged_path = writer._path
+
+    with pytest.raises(RuntimeError, match="cancel"), writer:
+        writer.write(b"not committed")
+        raise RuntimeError("cancel")
+
+    client.put_file.assert_not_called()
+    client.unlock.assert_called_once_with("lock-1")
+    assert not staged_path.exists()
+
+
+def test_writer_rejects_non_binary_and_random_writes():
+    client = SimpleNamespace(put_file=Mock(), unlock=Mock())
+    writer = DFSFileWriter(client, "/users/ana/new.bin")
+    try:
+        with pytest.raises(TypeError, match="bytes-like"):
+            writer.write("text")
+        with pytest.raises(OSError, match="sequential"):
+            writer.seek(0)
+    finally:
+        writer.abort()

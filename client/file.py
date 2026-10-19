@@ -1,10 +1,16 @@
 """Random-access, read-only handle for a DFSha file."""
 
+import logging
+import os
+import tempfile
 from collections import OrderedDict
+from pathlib import Path
 
 import grpc
 
 from .exceptions import IntegrityError
+
+logger = logging.getLogger(__name__)
 
 
 class DFSFile:
@@ -158,4 +164,119 @@ class DFSFile:
 
     def __exit__(self, exc_type, exc_value, traceback):
         self.close()
+        return False
+
+
+class DFSFileWriter:
+    """Sequential WORM writer that uploads its staged file on close."""
+
+    def __init__(
+        self,
+        client,
+        remote_path,
+        *,
+        overwrite=False,
+        lock_id=None,
+    ):
+        self._client = client
+        self._remote_path = remote_path
+        self._overwrite = overwrite
+        self._lock_id = lock_id
+        self._closed = False
+        fd, temp_name = tempfile.mkstemp(
+            prefix="dfsha-write-",
+            suffix=".part",
+        )
+        self._path = Path(temp_name)
+        try:
+            self._file = os.fdopen(fd, "w+b")
+        except OSError:
+            os.close(fd)
+            self._path.unlink(missing_ok=True)
+            raise
+
+    @property
+    def closed(self):
+        return self._closed
+
+    def write(self, data):
+        self._check_open()
+        if not isinstance(data, (bytes, bytearray, memoryview)):
+            raise TypeError("a bytes-like object is required, not str")
+        return self._file.write(data)
+
+    def flush(self):
+        self._check_open()
+        self._file.flush()
+
+    def tell(self):
+        self._check_open()
+        return self._file.tell()
+
+    def seek(self, offset, whence=0):
+        self._check_open()
+        raise OSError("DFSha writes are sequential; random writes are not supported")
+
+    def _check_open(self):
+        if self._closed:
+            raise ValueError("I/O operation on closed DFSFileWriter")
+
+    def _cleanup(self):
+        try:
+            self._file.close()
+        finally:
+            self._path.unlink(missing_ok=True)
+
+    def _release_lock(self, *, preserve_error):
+        if self._lock_id is None:
+            return
+        lock_id = self._lock_id
+        self._lock_id = None
+        try:
+            self._client.unlock(lock_id)
+        except Exception:
+            if not preserve_error:
+                raise
+            logger.exception("Unable to release lock %s after write failure", lock_id)
+
+    def close(self):
+        if self._closed:
+            return
+        failure = None
+        try:
+            self._file.flush()
+            self._file.close()
+            self._client.put_file(
+                self._path,
+                self._remote_path,
+                overwrite=self._overwrite,
+            )
+        except Exception as error:
+            failure = error
+            raise
+        finally:
+            self._closed = True
+            try:
+                self._cleanup()
+            finally:
+                self._release_lock(preserve_error=failure is not None)
+
+    def abort(self, *, preserve_error=False):
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._cleanup()
+        finally:
+            self._release_lock(preserve_error=preserve_error)
+
+    def __enter__(self):
+        self._check_open()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if exc_type is None:
+            self.close()
+        else:
+            self.abort(preserve_error=True)
         return False

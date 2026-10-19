@@ -1561,6 +1561,7 @@ class Namenode:
             host=self.settings.namenode_host,
             port=self.settings.namenode_port,
             log_level="info",
+            log_config=None,
         )
         server = uvicorn.Server(config)
         await server.serve()

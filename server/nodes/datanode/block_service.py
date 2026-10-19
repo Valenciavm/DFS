@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import os
 from collections.abc import AsyncIterator
 
@@ -16,6 +17,7 @@ from server.common.tokens import BlockOp, verify
 
 MAX_BLOCK_CHUNK_SIZE = 2 * MiB
 PIPELINE_CONNECT_TIMEOUT_S = 1.0
+logger = logging.getLogger(__name__)
 
 
 class BlockTokenInterceptor(grpc.aio.ServerInterceptor):
@@ -307,6 +309,12 @@ class BlockServiceImpl(pb2_grpc.BlockServiceServicer):
                 os.replace(temp_path, final_path)
                 self.storage.write_block_info(
                     header.block_id, bytes_received, computed_checksum
+                )
+                logger.info(
+                    "[DataNode %s] Stored block %s (%d bytes)",
+                    self.dn.node_id,
+                    header.block_id,
+                    bytes_received,
                 )
                 asyncio.create_task(
                     self.dn.notify_block_received(

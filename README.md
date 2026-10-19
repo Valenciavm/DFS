@@ -272,10 +272,20 @@ completo se pueden usar `put_file()` y `get_file()`.
 La demo usa bloques de 1 MiB, factor de replicación 3, quorum de escritura de
 dos réplicas y cinco DataNodes. Los servicios comparten una red privada de
 Compose; por eso conviene ejecutar el cliente dentro del servicio `client`.
-Para inspeccionar los logs:
+Los servicios NameNode y DataNode escriben sus logs a la salida estándar. En
+Compose, los mensajes `WARNING`, `ERROR` y `CRITICAL` se resaltan en amarillo o
+rojo; los mensajes informativos usan otro color. Para ver solo los eventos de
+los DataNodes:
 
 ```sh
-docker compose logs --follow namenode1 namenode2 datanode1 datanode2 datanode3 datanode4 datanode5
+docker compose logs --follow --tail=100 datanode1 datanode2 datanode3 datanode4 datanode5
+```
+
+Para ver el aviso del NameNode cuando un nodo deja de enviar heartbeats, abre
+otra terminal y sigue sus logs:
+
+```sh
+docker compose logs --follow --tail=100 namenode1 namenode2
 ```
 
 Se puede probar la detección de una caída deteniendo un DataNode:
@@ -286,7 +296,11 @@ docker compose logs --follow namenode1 namenode2
 docker compose start datanode1
 ```
 
-La detección y reparación toman tiempo. PostgreSQL tiene una réplica hot-standby,
+Los heartbeats exitosos y las comprobaciones periódicas de `/health` se omiten
+de los logs HTTP de NameNode y DataNode para que no oculten los eventos
+relevantes; los errores HTTP siguen apareciendo. Si un DataNode rechaza una réplica, busca `WARNING` o
+`ERROR` en los logs de los DataNodes y revisa qué dirección y puerto aparecen
+en el mensaje. La detección y reparación toman tiempo. PostgreSQL tiene una réplica hot-standby,
 pero ambos NameNodes se conectan al primario: la promoción automática y el
 cambio de DSN no están implementados. La promoción manual está documentada en
 [issue 09](docs/issues/09-docker-compose-and-cloud-deploy.md).

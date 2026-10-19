@@ -118,6 +118,9 @@ def test_two_transactions_cannot_reserve_the_same_path(postgres_database):
 
     assert results.count(None) == 1
     assert results.count(ErrorCode.UPLOAD_IN_PROGRESS) == 1
+    # The original store instance has a local metadata snapshot; reload it to
+    # observe the pending upload created by one of the concurrent instances.
+    store.load_snapshot()
     assert store.get_pending("/users/ana/race") is not None
 
 

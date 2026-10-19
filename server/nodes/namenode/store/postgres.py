@@ -652,6 +652,11 @@ class PostgresMetadataStore(MetadataStore):
                 """,
                 (dst_parent_id, dst_name, _to_timestamp(now), source["id"]),
             )
+            if source["kind"] == "file":
+                connection.execute(
+                    "UPDATE files SET modified_at = %s WHERE file_id = %s",
+                    (_to_timestamp(now), source["current_file_id"]),
+                )
             connection.execute(
                 "UPDATE inodes SET modified_at = %s WHERE id = ANY(%s)",
                 (_to_timestamp(now), [src_parent_id, dst_parent_id]),

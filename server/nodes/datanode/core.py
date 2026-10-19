@@ -316,6 +316,12 @@ class DataNode:
     async def handle_commands(self, commands: list[dict]):
         """Ejecuta las órdenes que el NameNode devuelve en el heartbeat."""
         for cmd in commands:
+            command_term = cmd.get("term", self.current_term)
+            if command_term < self.current_term:
+                continue
+            if command_term > self.current_term:
+                self.current_term = command_term
+                self._full_report_event.set()
             action = cmd.get("cmd")  # "replicate" | "delete"
             block_id = cmd.get("block_id")
             if not block_id:

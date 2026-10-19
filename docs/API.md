@@ -1,4 +1,4 @@
-# DFSha — API Contract (v0.8)
+# DFSha — API Contract (v0.10)
 
 > **Heads-up for the Client owner (v0.8):** paths on the wire are **global**. A user's home is `/users/<username>`, so the library must prefix relative paths with it and strip it when displaying. The server never rewrites paths. See Section 1.
 
@@ -72,10 +72,15 @@ Clients only ever receive `public_addr` values (called `addr` in the NameNode re
 | `JWT_TTL_S` | 3600 | NameNode access-token lifetime |
 | `JWT_SECRET` | required | HS256 signing secret for NameNode access tokens; never commit it |
 | `ADMIN_USER` / `ADMIN_PASSWORD` | unset | Optional pair that bootstraps the first admin account on first start |
+| `POSTGRES_DSN` | unset | Enables durable metadata/auth stores and NameNode lease-based HA |
 | `UPLOAD_TTL_S` | 3600 | A `put` that is never committed is garbage-collected after this |
 | `LS_DEFAULT_LIMIT` | 1000 | Default page size for `ls` |
 | `LEASE_S` | 15 | NameNode leader lease duration (Section 9) |
 | `FAILOVER_GRACE_S` | 30 | After a failover, the new leader waits this long before declaring any DataNode dead |
+| `NAMENODE_ID` | `nn1` | Unique identity for this NameNode process; set a different value for each replica |
+| `NAMENODE_URL` | `http://localhost:8000` | This NameNode's advertised URL, stored with its lease and returned as `leader_url` |
+| `NAMENODE_HOST` | `0.0.0.0` | Address on which this NameNode's REST API listens |
+| `NAMENODE_PORT` | `8000` | Port on which this NameNode's REST API listens |
 | `LOCK_DEFAULT_TTL_S` | 60 | Default lifetime of a file lock |
 | `MFA_CHALLENGE_TTL_S` | 300 | Lifetime of the single-use login challenge returned when 2FA is enabled (Section 4.1.1) |
 
@@ -296,7 +301,7 @@ All require `Authorization` (JWT or API key), except `register` and `login`.
   "entries": [
     { "name": "report.pdf", "type": "file", "size": 10485760,
       "modified_at": "2026-10-16T14:30:00Z", "owner": "ana" },
-    { "name": "data", "type": "dir", "size": 0,
+    { "name": "data", "type": "directory", "size": 0,
       "modified_at": "2026-10-15T09:00:00Z", "owner": "ana" }
   ],
   "next_cursor": "eyJhZnRlciI6ImRhdGEifQ"      // null when there are no more entries
@@ -311,14 +316,21 @@ All require `Authorization` (JWT or API key), except `register` and `login`.
 }
 
 // POST /v1/fs/mkdir
-{ "path": "/projects/data", "parents": false }          // → 201
+// `parents` is a query parameter.
+{ "path": "/projects/data" }                             // → 201
+// POST /v1/fs/mkdir?parents=true creates missing parent directories.
 
 // POST /v1/fs/mv
 { "src": "/a.txt", "dst": "/projects/a.txt" }           // → 200
 
 // PUT /v1/fs/acl
-{ "path": "/projects", "subject": "user:bruno",   "permission": "r" }    // "r" | "rw" | "none"
-{ "path": "/projects", "subject": "group:students", "permission": "rw" }
+{
+  "path": "/projects",
+  "entries": [
+    { "subject": "user:bruno", "permission": "r" },
+    { "subject": "group:students", "permission": "rw" }
+  ]
+} // permission: "r" | "rw" | "none"
 ```
 
 **Semantics**
@@ -338,9 +350,9 @@ Locks coordinate several clients working on the same path. They are enforced by 
 
 ```jsonc
 // POST /v1/fs/lock
-{ "path": "/projects/report.pdf", "mode": "shared", "ttl_s": 60 }     // mode: "shared" | "exclusive"
+{ "path": "/projects/report.pdf", "type": "shared", "ttl_s": 60 }     // type: "shared" | "exclusive"
 // → 200
-{ "lock_id": "lk_55a1", "path": "/projects/report.pdf", "mode": "shared", "expires_at": "2026-10-16T14:31:00Z" }
+{ "lock_id": "lk_55a1", "path": "/projects/report.pdf", "type": "shared", "expires_at": "2026-10-16T14:31:00Z" }
 
 // POST /v1/fs/lock/lk_55a1/renew
 { "ttl_s": 60 }                                                         // → 200 { "expires_at": "..." }
@@ -418,7 +430,13 @@ The client **talks to the NameNode only for metadata**; the bytes go directly to
   "file_checksum": "9f86...0a08"       // optional: SHA-256 of the whole file, for end-to-end verification
 }
 // Response 200
-{ "path": "/projects/report.pdf", "size": 10485760, "blocks": 3, "status": "committed" }
+{
+  "file_id": "7b0c9e0e-5e0a-4a58-9a11-1f0c6a3d2b11",
+  "path": "/projects/report.pdf",
+  "status": "committed",
+  "size": 10485760,
+  "blocks_committed": 3
+}
 ```
 
 The NameNode accepts `commit` only if:
@@ -436,7 +454,6 @@ Otherwise: `409 INSUFFICIENT_REPLICAS` or `422 CHECKSUM_MISMATCH`. Calling `comm
   "file_id": "7b0c9e0e-5e0a-4a58-9a11-1f0c6a3d2b11",
   "path": "/projects/report.pdf",
   "size": 10485760,
-  "block_size": 4194304,
   "checksum": "9f86...0a08",           // whole-file checksum, if the client provided one at commit
   "blocks": [
     {
@@ -481,7 +498,7 @@ Block tokens expire after `TOKEN_TTL_S`. For long uploads, the client asks for f
 
 ### 5.6 POST `/v1/files/{file_id}/abort`
 
-Cancels a pending upload: the path is released and reserved blocks are scheduled for deletion. `200 {}`. Idempotent.
+Cancels a pending upload: the path is released and reserved blocks are scheduled for deletion. `204 No Content`. Idempotent.
 
 ---
 
@@ -489,7 +506,7 @@ Cancels a pending upload: the path is released and reserved blocks are scheduled
 
 This is the **block-level read/write API** exposed to clients. It is a gRPC service (`BlockService`) over TLS; the DataNode does **not** expose HTTP endpoints. Every RPC except `Health` requires a block token, sent as call metadata `x-block-token` (Section 2.1).
 
-> **Who defines the messages.** This section fixes the *semantics* and the rules both sides must follow. The exact message definitions will live in a `.proto` file written by the DataNode owner and added to the repository through a Pull Request (team rule at the top of this document). Nothing in that `.proto` may contradict this section; if it needs to, this section is updated in the same PR.
+> **Protocol source of truth.** This section fixes the semantics and rules both sides must follow. The message definitions live in [`proto/block_service.proto`](../proto/block_service.proto); client and DataNode implementations must stay consistent with that schema.
 
 | RPC | Type | Description |
 |---|---|---|
@@ -584,11 +601,11 @@ All require `X-Node-Key` and are served **only by the current leader** (Section 
 
 // POST /v1/nodes/block-received
 { "node_id": "dn1", "block_id": "blk_7b0c9e0e_000000", "size": 4194304, "checksum": "ab12...ef" }
-// → 200 {}
+// → 200 { "status": "ok", "term": 4 }
 
 // POST /v1/nodes/block-corrupt
 { "node_id": "dn1", "block_id": "blk_7b0c9e0e_000000" }
-// → 200 {}   (the NameNode discards that replica and schedules a new copy)
+// → 200 { "status": "ok", "term": 4 }   (the NameNode discards that replica and schedules a new copy)
 ```
 
 **Commands a DataNode can receive**
@@ -656,8 +673,16 @@ These endpoints make the failover and re-replication demonstrable in the video (
 
 | Method | Path | Description |
 |---|---|---|
-| GET | `/v1/ha/status` | `{ "node_id": "nn1", "role": "leader" \| "standby", "term": 4, "degraded": false, "leader_url": "https://nn1…", "lease_expires_at": "2026-10-16T14:30:20Z" }` |
+| GET | `/v1/ha/status` | `{ "node_id": "nn1", "role": "leader" \| "standby", "term": 4, "degraded": false, "leader_url": "https://nn1…", "lease_expires_at": "2026-10-16T14:30:20Z" }`; `/health` remains available on standbys |
 | POST | `/v1/ha/stepdown` | Admin-only: the leader releases its lease so the standby can take over (planned handover, and the clean way to demo a failover) |
+
+With PostgreSQL configured, all requests except `/health` and `/v1/ha/status`
+are rejected on a standby with `503 NOT_LEADER` and the current `leader_url`.
+During a database outage, the leader continues serving cache-safe reads and
+DataNode soft-state reports, but rejects metadata writes with `503` and reports
+`degraded: true`. Auth users, API keys, groups and ACLs are loaded into the
+leader's cache; read audit records are buffered in memory until PostgreSQL
+recovers.
 
 ---
 
@@ -753,6 +778,7 @@ c.commit_upload(alloc)                                # POST /v1/files/{id}/comm
 
 | Version | Date | Change |
 |---|---|---|
+| 0.10 | 2026-10-18 | NameNode lease election, term fencing, standby/degraded request gates, `/v1/ha/stepdown`, and `term` in every DataNode REST response; added per-process NameNode identity/listen configuration |
 | 0.9 | 2026-10-18 | DataNode pipeline skips unavailable hops and retries later nodes from its disk-backed local copy; `ReadBlock` serves requested ranges in bounded chunks, `StatBlock` is implemented, and immutable writes are idempotent. Block RPC failures include `x-dfsha-error-code`; `BLOCK_CHUNK_SIZE` defaults to 1 MiB |
 | 0.8 | 2026-10-18 | **Namespace layout closed: one global tree, homes at `/users/<username>`** (Section 1). Wire paths are global; the client library maps its home to `/`. Error `NODE_NOT_REGISTERED` (409) added; `file_id` is UUID4 canonical; sizes are binary (MiB, GiB). Clarification more than change, but a client that assumed a per-user root must now prefix paths |
 | 0.7 | 2026-10-18 | **TOTP two-factor authentication** (new Section 4.1.1, endpoints `/v1/auth/login/2fa` and `/v1/auth/2fa/*`, new `MFA_CHALLENGE_TTL_S`). **`/v1/auth/login` can now return two different shapes**, so clients must branch on `mfa_required` instead of assuming `access_token` — the only breaking part of this version. API keys are explicitly exempt from 2FA. **Mutual TLS** required on node-to-node channels (Section 2). Decisions 8 and 9 in Section 11 updated |

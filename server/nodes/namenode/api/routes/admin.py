@@ -1,7 +1,7 @@
 """Admin and Health routes: /health, /v1/admin/*."""
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, status
 
@@ -19,10 +19,16 @@ async def health(
 ) -> HealthResponse:
     # Cluster is ok if there is at least one live node (or degraded if 0 nodes)
     live_count = sum(1 for n in nn.cluster.datanodes.values() if n.is_alive)
-    status_str = "ok" if live_count > 0 or not nn.cluster.datanodes else "degraded"
+    status_str: Literal["ok", "degraded", "not_leader"] = (
+        "not_leader"
+        if not nn.is_leader
+        else "degraded"
+        if nn.degraded or (live_count == 0 and nn.cluster.datanodes)
+        else "ok"
+    )
     return HealthResponse(
         status=status_str,
-        role="leader",
+        role="leader" if nn.is_leader else "standby",
         version="v1",
     )
 

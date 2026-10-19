@@ -21,10 +21,14 @@ import random
 import re
 import secrets
 import uuid
+from collections import deque
 from collections.abc import Callable
+from datetime import datetime
 from functools import wraps
 from inspect import signature
 from typing import Concatenate, ParamSpec, TypeVar
+
+import psycopg
 
 from argon2 import PasswordHasher
 
@@ -70,7 +74,12 @@ from server.nodes.namenode.store import (
     InMemoryMetadataStore,
     MetadataStore,
 )
-from server.nodes.namenode.store.postgres import PostgresDatabase, PostgresMetadataStore
+from server.nodes.namenode.store.postgres import (
+    LeaderGuard,
+    LeaderLease,
+    PostgresDatabase,
+    PostgresMetadataStore,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -148,27 +157,48 @@ class Namenode:
         database = None
         if store is None and self.settings.postgres_dsn:
             database = PostgresDatabase(self.settings.postgres_dsn)
-            store = PostgresMetadataStore(database, now=self.clock.time())
+            store = PostgresMetadataStore(
+                database, now=self.clock.time(), load_on_init=False
+            )
         self.store: MetadataStore = (
             store if store is not None else InMemoryMetadataStore(now=self.clock.time())
         )
+        if database is None and isinstance(self.store, PostgresMetadataStore):
+            database = self.store.database
         if auth_store is None:
-            if database is None and isinstance(self.store, PostgresMetadataStore):
-                database = self.store.database
             auth_store = (
                 PostgresAuthStore(database)
                 if database is not None
                 else InMemoryAuthStore()
             )
         self.auth_store: AuthStore = auth_store
+        self.database = database
+        self.node_id = self.settings.namenode_id
+        self.node_url = self.settings.namenode_url
+        self._ha_enabled = database is not None
+        self._is_leader = not self._ha_enabled
+        self._degraded = False
+        self._stepped_down = False
+        self._stepdown_retry_at: float | None = None
+        self.leader_id: str | None = self.node_id if self._is_leader else None
+        self.leader_url: str | None = self.node_url if self._is_leader else None
+        self.lease_expires_at: datetime | None = None
+        if database is not None:
+            database.fencing_required = True
         self._password_hasher = PasswordHasher()
         self.cluster = ClusterState()
-        #: leadership generation; fixed at 1 until the lease is implemented
-        self.term = 1
+        self.term = 1 if self._is_leader else 0
+        self._pending_audit: deque[AuditEntry] = deque()
         #: monotonic instant until which nobody is declared dead after a failover
         self._grace_until = 0.0
         if bool(self.settings.admin_user) != bool(self.settings.admin_password):
             raise ConfigError("ADMIN_USER and ADMIN_PASSWORD must be configured together")
+        if not self._ha_enabled:
+            self._bootstrap_admin_if_needed()
+        self._locks: dict[str, list[dict[str, object]]] = {}
+        self._locks_by_id: dict[str, dict[str, object]] = {}
+
+    def _bootstrap_admin_if_needed(self) -> None:
         if self.settings.admin_user and not self.auth_store.users():
             if len(self.settings.admin_password) < 8:
                 raise ConfigError("ADMIN_PASSWORD must contain at least 8 characters")
@@ -188,8 +218,139 @@ class Namenode:
                 )
             )
             self.store.mkdir(admin_home, self.settings.admin_user, self.clock.time(), parents=True)
-        self._locks: dict[str, list[dict[str, object]]] = {}
-        self._locks_by_id: dict[str, dict[str, object]] = {}
+
+    @property
+    def is_leader(self) -> bool:
+        return self._is_leader
+
+    @property
+    def degraded(self) -> bool:
+        return self._degraded
+
+    def _become_leader(self, lease: LeaderLease) -> None:
+        if self.database is None:
+            raise RuntimeError("cannot become leader without PostgreSQL")
+        try:
+            self.database.leader_guard = LeaderGuard(self.node_id, lease.term)
+            if isinstance(self.store, PostgresMetadataStore):
+                self.store.load_snapshot()
+            if isinstance(self.auth_store, PostgresAuthStore):
+                self.auth_store.load_cache()
+                self.auth_store.set_degraded(False)
+            self._flush_pending_audit()
+            self.cluster = ClusterState()
+            self.term = lease.term
+            self.leader_id = self.node_id
+            self.leader_url = self.node_url
+            self.lease_expires_at = lease.lease_expires_at
+            self._degraded = False
+            self.begin_failover_grace()
+            self._bootstrap_admin_if_needed()
+            self._is_leader = True
+            logger.info("NameNode %s acquired leadership at term %s", self.node_id, self.term)
+        except Exception:
+            self.database.leader_guard = None
+            self._is_leader = False
+            raise
+
+    def _become_standby(self, lease: LeaderLease) -> None:
+        if self.database is not None:
+            self.database.leader_guard = None
+        if isinstance(self.auth_store, PostgresAuthStore):
+            self.auth_store.set_degraded(False)
+        self._is_leader = False
+        self._degraded = False
+        self.term = lease.term
+        self.leader_id = lease.holder
+        self.leader_url = lease.url
+        self.lease_expires_at = lease.lease_expires_at
+        self.cluster = ClusterState()
+
+    async def refresh_leadership(self) -> None:
+        """Renew or acquire the PostgreSQL lease, retaining leadership on outage."""
+        if self.database is None:
+            return
+        if self._stepped_down:
+            try:
+                lease = self.database.current_leader()
+                self._become_standby(lease)
+            except psycopg.Error:
+                logger.exception("could not refresh leader status after stepdown")
+                return
+            if (
+                self._stepdown_retry_at is not None
+                and self.clock.monotonic() < self._stepdown_retry_at
+            ):
+                return
+            self._stepped_down = False
+            self._stepdown_retry_at = None
+        try:
+            if self._is_leader:
+                renewed = self.database.renew_leader(
+                    self.node_id, self.term, self.settings.lease_s
+                )
+                if renewed is not None:
+                    self.lease_expires_at = renewed.lease_expires_at
+                    self.leader_url = renewed.url
+                    if self._degraded:
+                        if isinstance(self.auth_store, PostgresAuthStore):
+                            self.auth_store.load_cache()
+                            self.auth_store.set_degraded(False)
+                        self._flush_pending_audit()
+                    self._degraded = False
+                    return
+
+            acquired = self.database.acquire_leader(
+                self.node_id, self.node_url, self.settings.lease_s
+            )
+            if acquired is not None:
+                if not self._is_leader or acquired.term != self.term:
+                    self._become_leader(acquired)
+                else:
+                    self.lease_expires_at = acquired.lease_expires_at
+                    self._degraded = False
+                return
+
+            self._become_standby(self.database.current_leader())
+        except psycopg.Error:
+            if self._is_leader:
+                self._degraded = True
+                if isinstance(self.auth_store, PostgresAuthStore):
+                    self.auth_store.set_degraded(True)
+                logger.exception(
+                    "NameNode %s cannot renew its lease; continuing in read-only degraded mode",
+                    self.node_id,
+                )
+            else:
+                logger.exception("NameNode %s cannot reach the lease database", self.node_id)
+
+    def step_down(self) -> None:
+        if self.database is None or not self._ha_enabled:
+            raise DfshaError(ErrorCode.BAD_REQUEST, "stepdown requires PostgreSQL HA")
+        if not self._is_leader:
+            raise DfshaError(
+                ErrorCode.NOT_LEADER,
+                "only the current leader can step down",
+                leader_url=self.leader_url,
+            )
+        if self._degraded:
+            raise DfshaError(
+                ErrorCode.NOT_LEADER,
+                "cannot release the lease while PostgreSQL is unavailable",
+                leader_url=self.leader_url,
+            )
+        if not self.database.release_leader(self.node_id, self.term):
+            self._become_standby(self.database.current_leader())
+            raise DfshaError(
+                ErrorCode.NOT_LEADER,
+                "leader lease was already lost",
+                leader_url=self.leader_url,
+            )
+        self._stepped_down = True
+        self._stepdown_retry_at = (
+            self.clock.monotonic() + self.settings.lease_renew_interval_s
+        )
+        self._become_standby(self.database.current_leader())
 
     # ---- authentication, groups and ACLs --------------------------------
 
@@ -213,9 +374,16 @@ class Namenode:
         result: str,
         request_id: str | None = None,
     ) -> None:
-        self.auth_store.audit(
-            AuditEntry(self.clock.time(), user, operation, path, result, request_id)
-        )
+        entry = AuditEntry(self.clock.time(), user, operation, path, result, request_id)
+        if self._degraded and isinstance(self.auth_store, PostgresAuthStore):
+            self._pending_audit.append(entry)
+            return
+        self.auth_store.audit(entry)
+
+    def _flush_pending_audit(self) -> None:
+        while self._pending_audit:
+            self.auth_store.audit(self._pending_audit[0])
+            self._pending_audit.popleft()
 
     def register_user(self, username: str, password: str) -> dict[str, str]:
         """Create a password-authenticated account with the default user role."""
@@ -1366,12 +1534,21 @@ class Namenode:
 
     async def run(self) -> None:
         """Runs the REST server and the background tasks until cancelled."""
-        await asyncio.gather(
+        await self.refresh_leadership()
+        tasks = [
             self.api_server(),
             self.monitor_datanodes(),
             self.monitor_replication(),
             self.garbage_collector(),
-        )
+        ]
+        if self.database is not None:
+            tasks.append(self.monitor_leadership())
+        await asyncio.gather(*tasks)
+
+    async def monitor_leadership(self) -> None:
+        while True:
+            await asyncio.sleep(self.settings.lease_renew_interval_s)
+            await self.refresh_leadership()
 
     async def api_server(self) -> None:
         """Serves the REST API using uvicorn and FastAPI."""
@@ -1405,7 +1582,8 @@ class Namenode:
         """
         while True:
             try:
-                task()
+                if self._is_leader and not self._degraded:
+                    task()
             except Exception:  # a background task must outlive any single failure
                 logger.exception("background task %s failed; will retry", getattr(task, "__name__", task))
             await asyncio.sleep(period_s)

@@ -24,6 +24,10 @@ def get_namenode() -> Namenode:
     return _shared_namenode
 
 
+def get_shared_namenode() -> Namenode | None:
+    return _shared_namenode
+
+
 async def get_current_principal(
     request: Request,
     authorization: Annotated[str | None, Header()] = None,

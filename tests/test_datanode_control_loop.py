@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+
 import httpx
 import pytest
 
@@ -70,6 +72,42 @@ async def test_datanode_registration_and_heartbeat(tmp_path, namenode_and_app):
 
         # El bloque debe haber sido eliminado por el comando delete
         assert dn.storage.count_blocks() == 0
+
+
+@pytest.mark.asyncio
+async def test_datanode_ignores_stale_commands_and_reports_on_new_terms(
+    tmp_path, namenode_and_app
+):
+    _, _, settings = namenode_and_app
+    dn = DataNode(
+        node_id="dn-term",
+        grpc_host="127.0.0.1",
+        grpc_port=9002,
+        internal_addr="127.0.0.1:9002",
+        public_addr="dn-term.example:9002",
+        storage_dir=str(tmp_path),
+        namenode_urls=["http://localhost:8000"],
+        config=settings,
+    )
+    dn.current_term = 5
+    dn.storage.write_block("stale-block", b"keep")
+
+    await dn.handle_commands(
+        [{"cmd": "delete", "block_id": "stale-block", "term": 4}]
+    )
+    assert dn.storage.get_block_info("stale-block") == (
+        len(b"keep"),
+        hashlib.sha256(b"keep").hexdigest(),
+    )
+
+    dn.storage.write_block("current-block", b"delete")
+    await dn.handle_commands(
+        [{"cmd": "delete", "block_id": "current-block", "term": 6}]
+    )
+    assert dn.current_term == 6
+    with pytest.raises(FileNotFoundError):
+        dn.storage.get_block_info("current-block")
+    assert dn._full_report_event.is_set()
 
 
 @pytest.mark.asyncio
@@ -259,4 +297,3 @@ async def test_write_block_triggers_block_received(tmp_path, namenode_and_app):
             assert nn.cluster.replica_checksums[block_id]["dn_grpc"] == checksum
         finally:
             await dn.grpc_server.stop(grace=0.5)
-

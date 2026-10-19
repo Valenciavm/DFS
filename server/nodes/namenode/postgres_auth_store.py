@@ -18,7 +18,7 @@ from server.nodes.namenode.auth_models import (
     Permission,
     User,
 )
-from server.nodes.namenode.auth_store import AuthStore
+from server.nodes.namenode.auth_store import AuthStore, InMemoryAuthStore
 from server.nodes.namenode.store.postgres import (
     ROOT_INODE_ID,
     PostgresDatabase,
@@ -43,6 +43,79 @@ class PostgresAuthStore(AuthStore):
             else PostgresDatabase(database, schema=schema)
         )
         self._password_hasher = password_hasher or PasswordHasher()
+        self._cache = InMemoryAuthStore()
+        self._cache_loaded = False
+        self.degraded = False
+
+    def load_cache(self) -> None:
+        """Load auth hard state for authenticated reads during DB degradation."""
+        with self.database.connect() as connection:
+            users = connection.execute(
+                "SELECT username, password_hash, role, created_at, totp_enabled "
+                "FROM users ORDER BY username"
+            ).fetchall()
+            api_keys = connection.execute(
+                """
+                SELECT k.id, u.username, k.name, k.key_hash, k.created_at, k.revoked_at
+                FROM api_keys k JOIN users u ON u.id = k.user_id
+                ORDER BY k.created_at, k.id
+                """
+            ).fetchall()
+            group_rows = connection.execute(
+                """
+                SELECT g.name, owner.username AS owner, member.username AS member
+                FROM groups g
+                JOIN users owner ON owner.id = g.owner_id
+                LEFT JOIN group_members gm ON gm.group_id = g.id
+                LEFT JOIN users member ON member.id = gm.user_id
+                ORDER BY g.name, member.username
+                """
+            ).fetchall()
+            acl_rows = connection.execute(
+                """
+                WITH RECURSIVE tree(id, path) AS (
+                    SELECT id, '/'::text FROM inodes WHERE parent_id IS NULL
+                    UNION ALL
+                    SELECT i.id,
+                           CASE WHEN tree.path = '/' THEN '/' || i.name
+                                ELSE tree.path || '/' || i.name END
+                    FROM inodes i JOIN tree ON i.parent_id = tree.id
+                )
+                SELECT tree.path, a.subject, a.permission
+                FROM acls a JOIN tree ON tree.id = a.inode_id
+                ORDER BY tree.path, a.subject
+                """
+            ).fetchall()
+
+        cache = InMemoryAuthStore()
+        for row in users:
+            cache.create_user(self._user_from_row(row))
+        for row in api_keys:
+            cache.create_api_key(self._api_key_from_row(row))
+        groups: dict[str, Group] = {}
+        for row in group_rows:
+            group = groups.setdefault(
+                row["name"], Group(row["name"], row["owner"])
+            )
+            if row["member"] is not None:
+                group.members.add(row["member"])
+        for group in groups.values():
+            cache.create_group(group)
+        for row in acl_rows:
+            cache.set_acl(
+                AclEntry(
+                    row["path"],
+                    row["subject"],
+                    Permission.parse(row["permission"]),
+                )
+            )
+        self._cache = cache
+        self._cache_loaded = True
+
+    def set_degraded(self, degraded: bool) -> None:
+        if degraded and not self._cache_loaded:
+            raise RuntimeError("auth cache must be loaded before degraded mode")
+        self.degraded = degraded
 
     def create_user(self, user: User) -> None:
         try:
@@ -59,15 +132,21 @@ class PostgresAuthStore(AuthStore):
                 )
         except UniqueViolation as error:
             raise DfshaError(ErrorCode.ALREADY_EXISTS, f"user {user.username} already exists") from error
+        self._cache.create_user(user)
 
     def get_user(self, username: str) -> User | None:
+        if self.degraded:
+            return self._cache.get_user(username)
         with self.database.connect() as connection:
             row = connection.execute(
                 "SELECT username, password_hash, role, created_at, totp_enabled "
                 "FROM users WHERE username = %s",
                 (username,),
             ).fetchone()
-        return self._user_from_row(row) if row is not None else None
+        user = self._user_from_row(row) if row is not None else None
+        if user is not None:
+            self._cache.create_user(user)
+        return user
 
     def verify_password(self, username: str, password: str) -> bool:
         user = self.get_user(username)
@@ -79,12 +158,17 @@ class PostgresAuthStore(AuthStore):
             return False
 
     def users(self) -> list[User]:
+        if self.degraded:
+            return self._cache.users()
         with self.database.connect() as connection:
             rows = connection.execute(
                 "SELECT username, password_hash, role, created_at, totp_enabled "
                 "FROM users ORDER BY username"
             ).fetchall()
-        return [self._user_from_row(row) for row in rows]
+        users = [self._user_from_row(row) for row in rows]
+        for user in users:
+            self._cache.create_user(user)
+        return users
 
     def create_api_key(self, api_key: ApiKey) -> None:
         try:
@@ -104,8 +188,11 @@ class PostgresAuthStore(AuthStore):
             raise DfshaError(
                 ErrorCode.ALREADY_EXISTS, f"API key {api_key.key_id} already exists"
             ) from error
+        self._cache.create_api_key(api_key)
 
     def get_api_key(self, key_id: str) -> ApiKey | None:
+        if self.degraded:
+            return self._cache.get_api_key(key_id)
         with self.database.connect() as connection:
             row = connection.execute(
                 """
@@ -114,9 +201,14 @@ class PostgresAuthStore(AuthStore):
                 """,
                 (key_id,),
             ).fetchone()
-        return self._api_key_from_row(row) if row is not None else None
+        api_key = self._api_key_from_row(row) if row is not None else None
+        if api_key is not None:
+            self._cache.create_api_key(api_key)
+        return api_key
 
     def get_api_key_by_hash(self, key_hash: str) -> ApiKey | None:
+        if self.degraded:
+            return self._cache.get_api_key_by_hash(key_hash)
         with self.database.connect() as connection:
             row = connection.execute(
                 """
@@ -125,9 +217,14 @@ class PostgresAuthStore(AuthStore):
                 """,
                 (key_hash,),
             ).fetchone()
-        return self._api_key_from_row(row) if row is not None else None
+        api_key = self._api_key_from_row(row) if row is not None else None
+        if api_key is not None:
+            self._cache.create_api_key(api_key)
+        return api_key
 
     def api_keys(self) -> list[ApiKey]:
+        if self.degraded:
+            return self._cache.api_keys()
         with self.database.connect() as connection:
             rows = connection.execute(
                 """
@@ -135,9 +232,14 @@ class PostgresAuthStore(AuthStore):
                 FROM api_keys k JOIN users u ON u.id = k.user_id ORDER BY k.created_at, k.id
                 """
             ).fetchall()
-        return [self._api_key_from_row(row) for row in rows]
+        api_keys = [self._api_key_from_row(row) for row in rows]
+        for api_key in api_keys:
+            self._cache.create_api_key(api_key)
+        return api_keys
 
     def groups(self) -> list[Group]:
+        if self.degraded:
+            return self._cache.groups()
         with self.database.connect() as connection:
             rows = connection.execute(
                 """
@@ -154,7 +256,10 @@ class PostgresAuthStore(AuthStore):
             group = grouped.setdefault(row["name"], Group(row["name"], row["owner"]))
             if row["member"] is not None:
                 group.members.add(row["member"])
-        return [replace(group, members=set(group.members)) for group in grouped.values()]
+        result = [replace(group, members=set(group.members)) for group in grouped.values()]
+        for group in result:
+            self._cache.create_group(group)
+        return result
 
     def revoke_api_key(self, key_id: str, now: float) -> ApiKey | None:
         with self.database.write_transaction() as connection:
@@ -174,7 +279,7 @@ class PostgresAuthStore(AuthStore):
             if user_row is None:
                 raise RuntimeError("API key refers to a missing user")
             username = user_row["username"]
-        return ApiKey(
+        api_key = ApiKey(
             key_id=row["id"],
             user_id=username,
             name=row["name"],
@@ -182,8 +287,12 @@ class PostgresAuthStore(AuthStore):
             created_at=_from_timestamp(row["created_at"]) or 0,
             revoked_at=_from_timestamp(row["revoked_at"]),
         )
+        self._cache.create_api_key(api_key)
+        return api_key
 
     def list_api_keys(self, username: str) -> list[ApiKey]:
+        if self.degraded:
+            return self._cache.list_api_keys(username)
         with self.database.connect() as connection:
             rows = connection.execute(
                 """
@@ -193,7 +302,10 @@ class PostgresAuthStore(AuthStore):
                 """,
                 (username,),
             ).fetchall()
-        return [self._api_key_from_row(row) for row in rows]
+        api_keys = [self._api_key_from_row(row) for row in rows]
+        for api_key in api_keys:
+            self._cache.create_api_key(api_key)
+        return api_keys
 
     def create_group(self, group: Group) -> None:
         try:
@@ -213,8 +325,11 @@ class PostgresAuthStore(AuthStore):
                     )
         except UniqueViolation as error:
             raise DfshaError(ErrorCode.ALREADY_EXISTS, f"group {group.name} already exists") from error
+        self._cache.create_group(group)
 
     def get_group(self, name: str) -> Group | None:
+        if self.degraded:
+            return self._cache.get_group(name)
         with self.database.connect() as connection:
             rows = connection.execute(
                 """
@@ -230,6 +345,7 @@ class PostgresAuthStore(AuthStore):
             return None
         group = Group(name, rows[0]["owner"])
         group.members.update(row["member"] for row in rows if row["member"] is not None)
+        self._cache.create_group(group)
         return group
 
     def update_group_members(self, name: str, members: set[str]) -> Group:
@@ -249,6 +365,7 @@ class PostgresAuthStore(AuthStore):
         group = self.get_group(name)
         if group is None:
             raise RuntimeError(f"group {name} disappeared after member update")
+        self._cache.create_group(group)
         return group
 
     def set_acl(self, entry: AclEntry) -> None:
@@ -268,18 +385,24 @@ class PostgresAuthStore(AuthStore):
                 """,
                 (inode_id, entry.subject, permission),
             )
+        self._cache.set_acl(entry)
 
     def get_acl(self, path: str) -> list[AclEntry]:
+        if self.degraded:
+            return self._cache.get_acl(path)
         with self.database.connect() as connection:
             inode_id = self._inode_id(connection, path)
             rows = connection.execute(
                 "SELECT subject, permission FROM acls WHERE inode_id = %s ORDER BY subject",
                 (inode_id,),
             ).fetchall()
-        return [
+        entries = [
             AclEntry(path, row["subject"], Permission.parse(row["permission"]))
             for row in rows
         ]
+        for entry in entries:
+            self._cache.set_acl(entry)
+        return entries
 
     def remove_acl_subtree(self, path: str) -> None:
         segments = split_path(path)
@@ -303,6 +426,7 @@ class PostgresAuthStore(AuthStore):
             ids = [row["id"] for row in rows]
             if ids:
                 connection.execute("DELETE FROM acls WHERE inode_id = ANY(%s)", (ids,))
+        self._cache.remove_acl_subtree(canonical)
 
     def audit(self, entry: AuditEntry) -> None:
         with self.database.write_transaction() as connection:

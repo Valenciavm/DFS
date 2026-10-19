@@ -1,0 +1,310 @@
+name: dfsha
+
+services:
+  postgres-primary:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB in .env}
+      POSTGRES_REPLICATION_USER: ${POSTGRES_REPLICATION_USER:?Set POSTGRES_REPLICATION_USER in .env}
+      POSTGRES_REPLICATION_PASSWORD: ${POSTGRES_REPLICATION_PASSWORD:?Set POSTGRES_REPLICATION_PASSWORD in .env}
+    command:
+      - postgres
+      - -c
+      - wal_level=replica
+      - -c
+      - max_wal_senders=10
+      - -c
+      - max_replication_slots=10
+    volumes:
+      - postgres-primary-data:/var/lib/postgresql/data
+      - ./scripts/init-postgres-primary.sh:/docker-entrypoint-initdb.d/10-replication.sh:ro
+    networks:
+      - postgres-private
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+  postgres-replica:
+    build:
+      context: .
+      dockerfile: docker/postgres-replica.Dockerfile
+    environment:
+      PGDATA: /var/lib/postgresql/data
+      PRIMARY_HOST: postgres-primary
+      PRIMARY_PORT: "5432"
+      POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB in .env}
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
+      REPLICATION_USER: ${POSTGRES_REPLICATION_USER:?Set POSTGRES_REPLICATION_USER in .env}
+      REPLICATION_PASSWORD: ${POSTGRES_REPLICATION_PASSWORD:?Set POSTGRES_REPLICATION_PASSWORD in .env}
+    volumes:
+      - postgres-replica-data:/var/lib/postgresql/data
+    networks:
+      - postgres-private
+    depends_on:
+      postgres-primary:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 15s
+    restart: unless-stopped
+
+  namenode1:
+    build:
+      context: .
+      dockerfile: docker/namenode.Dockerfile
+    environment: &namenode-environment
+      BLOCK_SIZE: ${BLOCK_SIZE:?Set BLOCK_SIZE in .env}
+      BLOCK_CHUNK_SIZE: ${BLOCK_CHUNK_SIZE:?Set BLOCK_CHUNK_SIZE in .env}
+      REPLICATION_FACTOR: ${REPLICATION_FACTOR:?Set REPLICATION_FACTOR in .env}
+      MIN_REPLICAS_COMMIT: ${MIN_REPLICAS_COMMIT:?Set MIN_REPLICAS_COMMIT in .env}
+      BLOCK_TOKEN_SECRET: ${BLOCK_TOKEN_SECRET:?Set BLOCK_TOKEN_SECRET in .env}
+      NODE_KEY: ${NODE_KEY:?Set NODE_KEY in .env}
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env}
+      ADMIN_USER: ${ADMIN_USER:?Set ADMIN_USER in .env}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD in .env}
+      MFA_CHALLENGE_TTL_S: ${MFA_CHALLENGE_TTL_S:-300}
+      POSTGRES_DSN: ${POSTGRES_PRIMARY_DSN:?Set POSTGRES_PRIMARY_DSN in .env}
+      NAMENODE_ID: nn1
+      NAMENODE_URL: http://namenode1:8000
+      NAMENODE_HOST: 0.0.0.0
+      NAMENODE_PORT: "8000"
+    ports:
+      - "8001:8000"
+    networks:
+      - dfsha-private
+      - postgres-private
+    depends_on:
+      postgres-primary:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "from urllib.request import urlopen; urlopen('http://127.0.0.1:8000/health', timeout=2)"
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 15s
+    restart: unless-stopped
+
+  namenode2:
+    build:
+      context: .
+      dockerfile: docker/namenode.Dockerfile
+    environment:
+      <<: *namenode-environment
+      NAMENODE_ID: nn2
+      NAMENODE_URL: http://namenode2:8000
+    ports:
+      - "8002:8000"
+    networks:
+      - dfsha-private
+      - postgres-private
+    depends_on:
+      postgres-primary:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "from urllib.request import urlopen; urlopen('http://127.0.0.1:8000/health', timeout=2)"
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 15s
+    restart: unless-stopped
+
+  # The five independently named services below preserve separate block volumes.
+  datanode1: &datanode
+    build:
+      context: .
+      dockerfile: docker/datanode.Dockerfile
+    command:
+      - python
+      - -m
+      - server.nodes.datanode
+      - --id
+      - datanode1
+      - --host
+      - 0.0.0.0
+      - --port
+      - "9001"
+      - --internal-addr
+      - datanode1:9001
+      - --public-addr
+      - datanode1:9001
+      - --storage
+      - /var/lib/dfsha/blocks
+      - --namenode-urls
+      - ${NAMENODE_URLS:?Set NAMENODE_URLS in .env}
+    environment:
+      BLOCK_TOKEN_SECRET: ${BLOCK_TOKEN_SECRET:?Set BLOCK_TOKEN_SECRET in .env}
+      NODE_KEY: ${NODE_KEY:?Set NODE_KEY in .env}
+      BLOCK_CHUNK_SIZE: ${BLOCK_CHUNK_SIZE:?Set BLOCK_CHUNK_SIZE in .env}
+      DATANODE_MASTER_KEY: ${DATANODE_MASTER_KEY:?Set DATANODE_MASTER_KEY in .env}
+    volumes:
+      - datanode1-data:/var/lib/dfsha
+    networks:
+      - dfsha-private
+    depends_on:
+      namenode1:
+        condition: service_healthy
+      namenode2:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import grpc; from proto import block_service_pb2 as p, block_service_pb2_grpc as g; c=grpc.insecure_channel('127.0.0.1:9001'); r=g.BlockServiceStub(c).Health(p.HealthRequest(), timeout=2); c.close(); assert r.status == 'ok'"
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+  datanode2:
+    <<: *datanode
+    command:
+      - python
+      - -m
+      - server.nodes.datanode
+      - --id
+      - datanode2
+      - --host
+      - 0.0.0.0
+      - --port
+      - "9001"
+      - --internal-addr
+      - datanode2:9001
+      - --public-addr
+      - datanode2:9001
+      - --storage
+      - /var/lib/dfsha/blocks
+      - --namenode-urls
+      - ${NAMENODE_URLS:?Set NAMENODE_URLS in .env}
+    volumes:
+      - datanode2-data:/var/lib/dfsha
+
+  datanode3:
+    <<: *datanode
+    command:
+      - python
+      - -m
+      - server.nodes.datanode
+      - --id
+      - datanode3
+      - --host
+      - 0.0.0.0
+      - --port
+      - "9001"
+      - --internal-addr
+      - datanode3:9001
+      - --public-addr
+      - datanode3:9001
+      - --storage
+      - /var/lib/dfsha/blocks
+      - --namenode-urls
+      - ${NAMENODE_URLS:?Set NAMENODE_URLS in .env}
+    volumes:
+      - datanode3-data:/var/lib/dfsha
+
+  datanode4:
+    <<: *datanode
+    command:
+      - python
+      - -m
+      - server.nodes.datanode
+      - --id
+      - datanode4
+      - --host
+      - 0.0.0.0
+      - --port
+      - "9001"
+      - --internal-addr
+      - datanode4:9001
+      - --public-addr
+      - datanode4:9001
+      - --storage
+      - /var/lib/dfsha/blocks
+      - --namenode-urls
+      - ${NAMENODE_URLS:?Set NAMENODE_URLS in .env}
+    volumes:
+      - datanode4-data:/var/lib/dfsha
+
+  datanode5:
+    <<: *datanode
+    command:
+      - python
+      - -m
+      - server.nodes.datanode
+      - --id
+      - datanode5
+      - --host
+      - 0.0.0.0
+      - --port
+      - "9001"
+      - --internal-addr
+      - datanode5:9001
+      - --public-addr
+      - datanode5:9001
+      - --storage
+      - /var/lib/dfsha/blocks
+      - --namenode-urls
+      - ${NAMENODE_URLS:?Set NAMENODE_URLS in .env}
+    volumes:
+      - datanode5-data:/var/lib/dfsha
+
+  client:
+    build:
+      context: .
+      dockerfile: docker/client.Dockerfile
+    environment:
+      NAMENODE_URLS: ${NAMENODE_URLS:?Set NAMENODE_URLS in .env}
+      ADMIN_USER: ${ADMIN_USER:?Set ADMIN_USER in .env}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD in .env}
+    networks:
+      - dfsha-private
+    depends_on:
+      namenode1:
+        condition: service_healthy
+      namenode2:
+        condition: service_healthy
+      datanode1:
+        condition: service_healthy
+      datanode2:
+        condition: service_healthy
+      datanode3:
+        condition: service_healthy
+      datanode4:
+        condition: service_healthy
+      datanode5:
+        condition: service_healthy
+    restart: unless-stopped
+
+networks:
+  dfsha-private:
+    driver: bridge
+  postgres-private:
+    driver: bridge
+    internal: true
+
+volumes:
+  postgres-primary-data:
+  postgres-replica-data:
+  datanode1-data:
+  datanode2-data:
+  datanode3-data:
+  datanode4-data:
+  datanode5-data:

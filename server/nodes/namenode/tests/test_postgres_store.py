@@ -218,6 +218,34 @@ def test_authentication_records_are_durable_and_separate(postgres_database):
     ]
 
 
+def test_auth_snapshot_serves_cache_reads_during_database_degradation(
+    postgres_database, monkeypatch
+):
+    metadata = new_store(postgres_database)
+    hasher = PasswordHasher(time_cost=1, memory_cost=8192)
+    auth = PostgresAuthStore(postgres_database, password_hasher=hasher)
+    auth.create_user(User("ana", hasher.hash("correct-password"), "user", T0))
+    auth.create_api_key(ApiKey("key-1", "ana", "laptop", "digest", T0))
+    auth.create_group(Group("students", "ana"))
+    metadata.mkdir("/users/ana/shared", "ana", T0)
+    auth.set_acl(AclEntry("/users/ana/shared", "group:students", Permission.READ))
+    auth.load_cache()
+
+    def database_unavailable():
+        raise AssertionError("degraded auth reads must not access PostgreSQL")
+
+    monkeypatch.setattr(auth.database, "connect", database_unavailable)
+    auth.set_degraded(True)
+
+    assert auth.get_user("ana").username == "ana"
+    assert auth.verify_password("ana", "correct-password")
+    assert auth.get_api_key_by_hash("digest").key_id == "key-1"
+    assert auth.get_group("students").name == "students"
+    assert auth.get_acl("/users/ana/shared") == [
+        AclEntry("/users/ana/shared", "group:students", Permission.READ)
+    ]
+
+
 def test_leader_guard_rejects_stale_writes_and_accepts_the_current_term(postgres_database):
     guarded = PostgresDatabase(
         postgres_database.dsn,
@@ -245,3 +273,56 @@ def test_leader_guard_rejects_stale_writes_and_accepts_the_current_term(postgres
     with pytest.raises(DfshaError) as stale:
         store.mkdir("/users/ana/blocked", "ana", T0)
     assert stale.value.code is ErrorCode.NOT_LEADER
+
+
+def test_leases_are_exclusive_renewable_and_fenced(postgres_database):
+    first = postgres_database.acquire_leader("nn-1", "http://nn-1:8000", 15)
+    assert first is not None
+    assert first.holder == "nn-1"
+    assert first.term == 1
+    assert postgres_database.acquire_leader("nn-2", "http://nn-2:8000", 15) is None
+
+    renewed = postgres_database.renew_leader("nn-1", 1, 15)
+    assert renewed is not None
+    assert renewed.term == 1
+    assert postgres_database.renew_leader("nn-1", 0, 15) is None
+    assert not postgres_database.release_leader("nn-1", 0)
+    assert postgres_database.release_leader("nn-1", 1)
+
+    second = postgres_database.acquire_leader("nn-2", "http://nn-2:8000", 15)
+    assert second is not None
+    assert second.holder == "nn-2"
+    assert second.term == 2
+    assert postgres_database.current_leader() == second
+
+
+def test_only_one_concurrent_name_node_can_acquire_an_expired_lease(postgres_database):
+    barrier = Barrier(2)
+
+    def acquire(node_id: str):
+        barrier.wait()
+        return postgres_database.acquire_leader(
+            node_id, f"http://{node_id}:8000", 15
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        leases = list(executor.map(acquire, ("nn-a", "nn-b")))
+
+    winners = [lease for lease in leases if lease is not None]
+    assert len(winners) == 1
+    assert winners[0].term == 1
+
+
+def test_expired_lease_increments_term_even_for_the_same_holder(postgres_database):
+    first = postgres_database.acquire_leader("nn-1", "http://nn-1:8000", 15)
+    assert first is not None
+    with postgres_database.connect() as connection:
+        connection.execute(
+            "UPDATE leader SET lease_expires_at = clock_timestamp() - interval '1 second' "
+            "WHERE singleton = TRUE"
+        )
+
+    reacquired = postgres_database.acquire_leader("nn-1", "http://nn-1:8000", 15)
+
+    assert reacquired is not None
+    assert reacquired.term == first.term + 1

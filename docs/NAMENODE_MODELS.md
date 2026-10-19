@@ -183,7 +183,7 @@ The interface through which the NameNode core reads and writes **hard state**. T
 
 | Implementation | Use |
 |---|---|
-| `PostgresMetadataStore` | Durable metadata when `POSTGRES_DSN` is configured. Writes use transactions; an optional `LeaderGuard` fences them against a holder, term and unexpired lease. Issue 06 wires this to HA. |
+| `PostgresMetadataStore` | Durable metadata when `POSTGRES_DSN` is configured. Writes use transactions; HA enables a `LeaderGuard` that fences them against a holder, term and unexpired lease. |
 | `InMemoryMetadataStore` | Unit tests only (fake time, no database) |
 
 Responsibilities:

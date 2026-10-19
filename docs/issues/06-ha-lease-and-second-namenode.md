@@ -135,7 +135,7 @@ store double that executes the same conditional operations):
 
 - [ ] Two NameNodes share one metadata database and never both write.
 - [ ] Lease acquisition, renewal, release and fencing are atomic in SQL.
-- [ ] `term` is propagated to DataNodes and commands.
+- [x] `term` is propagated to DataNodes and commands.
 - [ ] Soft state is rebuilt from register/block-report, not persisted as SQL.
 - [ ] Pending uploads survive leader failure.
 - [ ] Degraded read-only behavior is observable and tested.

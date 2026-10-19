@@ -57,6 +57,16 @@ class LeaderGuard:
     term: int
 
 
+@dataclass(frozen=True)
+class LeaderLease:
+    """Current durable leader row, including the database's UTC expiry."""
+
+    holder: str | None
+    url: str | None
+    term: int
+    lease_expires_at: datetime
+
+
 class PostgresDatabase:
     """Shared connection and migration boundary for metadata and auth stores."""
 
@@ -74,6 +84,7 @@ class PostgresDatabase:
         self.dsn = dsn
         self.schema = schema
         self.leader_guard = leader_guard
+        self.fencing_required = False
         self.migrate()
 
     def connect(self) -> Connection[Row]:
@@ -90,7 +101,7 @@ class PostgresDatabase:
             if self.leader_guard is not None:
                 leader = connection.execute(
                     """
-                    SELECT holder, term
+                    SELECT holder, url, term
                     FROM leader
                     WHERE singleton = TRUE AND lease_expires_at > clock_timestamp()
                     FOR SHARE
@@ -101,8 +112,100 @@ class PostgresDatabase:
                     or leader["holder"] != self.leader_guard.holder
                     or leader["term"] != self.leader_guard.term
                 ):
-                    raise DfshaError(ErrorCode.NOT_LEADER, "stale or expired leader lease")
+                    raise DfshaError(
+                        ErrorCode.NOT_LEADER,
+                        "stale or expired leader lease",
+                        leader_url=leader["url"] if leader is not None else None,
+                    )
+            elif self.fencing_required:
+                leader = connection.execute(
+                    "SELECT url FROM leader WHERE singleton = TRUE"
+                ).fetchone()
+                raise DfshaError(
+                    ErrorCode.NOT_LEADER,
+                    "this NameNode has not acquired the leader lease",
+                    leader_url=leader["url"] if leader is not None else None,
+                )
             yield connection
+
+    def acquire_leader(
+        self, holder: str, url: str, lease_s: int
+    ) -> LeaderLease | None:
+        """Atomically acquire an expired lease or renew this same identity."""
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                UPDATE leader
+                SET term = CASE
+                        WHEN holder = %s AND lease_expires_at > clock_timestamp()
+                            THEN term
+                        ELSE term + 1
+                    END,
+                    holder = %s,
+                    url = %s,
+                    lease_expires_at = clock_timestamp() + (%s * interval '1 second')
+                WHERE singleton = TRUE
+                  AND (
+                      lease_expires_at <= clock_timestamp()
+                      OR (holder = %s AND lease_expires_at > clock_timestamp())
+                  )
+                RETURNING holder, url, term, lease_expires_at
+                """,
+                (holder, holder, url, lease_s, holder),
+            ).fetchone()
+        return self._lease_from_row(row) if row is not None else None
+
+    def renew_leader(
+        self, holder: str, term: int, lease_s: int
+    ) -> LeaderLease | None:
+        """Extend only a currently valid lease for this exact holder and term."""
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                UPDATE leader
+                SET lease_expires_at = clock_timestamp() + (%s * interval '1 second')
+                WHERE singleton = TRUE AND holder = %s AND term = %s
+                  AND lease_expires_at > clock_timestamp()
+                RETURNING holder, url, term, lease_expires_at
+                """,
+                (lease_s, holder, term),
+            ).fetchone()
+        return self._lease_from_row(row) if row is not None else None
+
+    def release_leader(self, holder: str, term: int) -> bool:
+        """Expire the lease only if the caller still owns its current term."""
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                UPDATE leader
+                SET holder = NULL, url = NULL, lease_expires_at = clock_timestamp()
+                WHERE singleton = TRUE AND holder = %s AND term = %s
+                RETURNING term
+                """,
+                (holder, term),
+            ).fetchone()
+        return row is not None
+
+    def current_leader(self) -> LeaderLease:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT holder, url, term, lease_expires_at
+                FROM leader WHERE singleton = TRUE
+                """
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("PostgreSQL leader singleton row is missing")
+        return self._lease_from_row(row)
+
+    @staticmethod
+    def _lease_from_row(row: Row) -> LeaderLease:
+        return LeaderLease(
+            holder=row["holder"],
+            url=row["url"],
+            term=row["term"],
+            lease_expires_at=row["lease_expires_at"],
+        )
 
     def migrate(self) -> None:
         migration_dir = Path(__file__).with_name("migrations")
@@ -142,6 +245,7 @@ class PostgresMetadataStore(MetadataStore):
         *,
         leader_guard: LeaderGuard | None = None,
         schema: str | None = None,
+        load_on_init: bool = True,
     ) -> None:
         self.database = (
             database if isinstance(database, PostgresDatabase)
@@ -150,7 +254,8 @@ class PostgresMetadataStore(MetadataStore):
         if leader_guard is not None:
             self.database.leader_guard = leader_guard
         self._cache = InMemoryMetadataStore(now=now)
-        self.load_snapshot()
+        if load_on_init:
+            self.load_snapshot()
 
     def _mutate(self, operation: Callable[[Connection[Row]], T]) -> T:
         try:
@@ -807,4 +912,9 @@ class PostgresMetadataStore(MetadataStore):
         )
 
 
-__all__ = ["LeaderGuard", "PostgresDatabase", "PostgresMetadataStore"]
+__all__ = [
+    "LeaderGuard",
+    "LeaderLease",
+    "PostgresDatabase",
+    "PostgresMetadataStore",
+]

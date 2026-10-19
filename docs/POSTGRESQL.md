@@ -1,16 +1,18 @@
 # PostgreSQL persistence and local replication
 
 `POSTGRES_DSN` opts the NameNode into `PostgresMetadataStore` and
-`PostgresAuthStore`. Without it, the NameNode continues to use in-memory
-stores. Numbered SQL migrations run automatically at startup. The metadata
-namespace and authentication/ACL data are separate store interfaces over the
-same database.
+`PostgresAuthStore`, and enables HA lease election. Without it, the NameNode
+continues to use in-memory stores and runs as a standalone leader. Numbered
+SQL migrations run automatically at startup. The metadata namespace and
+authentication/ACL data are separate store interfaces over the same database.
+Each HA process must use a distinct `NAMENODE_ID`, its own advertised
+`NAMENODE_URL`, and an appropriate `NAMENODE_HOST` / `NAMENODE_PORT`.
 
 The database stores hard state only. DataNode liveness, replica locations,
 pipelines and pending commands remain in the NameNode's in-memory
-`ClusterState`. The local standby is for manual recovery, not read scaling.
-Issue 03 does not implement automatic NameNode failover, endpoint discovery or
-database reconnection; those behaviors belong to issue 06.
+`ClusterState`. The database's local streaming standby is for database recovery,
+not read scaling. NameNode lease failover and degraded read-only behavior are
+implemented in issue 06; client endpoint discovery remains a client concern.
 
 ## Run the PostgreSQL integration tests
 

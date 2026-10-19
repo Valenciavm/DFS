@@ -1,9 +1,10 @@
 """Pydantic schemas for the NameNode REST API, matching docs/API.md."""
 from __future__ import annotations
 
-from typing import Any, Literal
-from pydantic import BaseModel, Field
+from datetime import datetime
+from typing import Literal
 
+from pydantic import BaseModel, Field
 
 # ---------------------------------------------------------------------------
 # Section 3: Error format
@@ -122,6 +123,21 @@ class SetAclRequest(BaseModel):
     entries: list[AclSubject]
 
 
+class CreateGroupRequest(BaseModel):
+    name: str
+
+
+class UpdateGroupMembersRequest(BaseModel):
+    add: list[str] = Field(default_factory=list)
+    remove: list[str] = Field(default_factory=list)
+
+
+class GroupResponse(BaseModel):
+    name: str
+    owner: str
+    members: list[str]
+
+
 # ---------------------------------------------------------------------------
 # Section 4.4: Locks schemas
 # ---------------------------------------------------------------------------
@@ -147,11 +163,13 @@ class PutFileRequest(BaseModel):
     path: str
     size: int
     replication: int | None = None
+    overwrite: bool = False
 
 
 class DataNodePublicSchema(BaseModel):
     node_id: str
     addr: str  # public_addr reachable from the user's machine
+    internal_addr: str | None = None
 
 
 class PlannedBlockSchema(BaseModel):
@@ -178,8 +196,9 @@ class CommittedBlockSchema(BaseModel):
 
 
 class CommitFileRequest(BaseModel):
-    file_id: str
+    file_id: str | None = None
     blocks: list[CommittedBlockSchema]
+    file_checksum: str | None = None
 
 
 class CommitFileResponse(BaseModel):
@@ -209,6 +228,7 @@ class GetFileResponse(BaseModel):
     path: str
     size: int
     blocks: list[BlockLocationSchema]
+    checksum: str | None = None
 
 
 class RenewTokenRequest(BaseModel):
@@ -247,6 +267,7 @@ class HeartbeatRequest(BaseModel):
 class NodeCommandSchema(BaseModel):
     cmd: Literal["replicate", "delete"]
     block_id: str
+    term: int = 1
     targets: list[str] | None = None
     token: str | None = None
 
@@ -282,6 +303,7 @@ class BlockReceivedRequest(BaseModel):
 
 class BlockReceivedResponse(BaseModel):
     status: Literal["ok"]
+    term: int = 1
 
 
 class BlockCorruptRequest(BaseModel):
@@ -292,6 +314,7 @@ class BlockCorruptRequest(BaseModel):
 
 class BlockCorruptResponse(BaseModel):
     status: Literal["ok"]
+    term: int = 1
 
 
 # ---------------------------------------------------------------------------
@@ -319,6 +342,11 @@ class ClusterStatsResponse(BaseModel):
 
 class HAStatusResponse(BaseModel):
     role: Literal["leader", "standby"]
-    leader_id: str
-    generation: int
+    node_id: str
+    term: int
+    degraded: bool = False
+    leader_url: str | None = None
+    lease_expires_at: datetime | None = None
+    leader_id: str | None = None
+    generation: int | None = None
     lease_expires_in_s: int | None = None

@@ -6,7 +6,6 @@ from fastapi.testclient import TestClient
 
 from server.nodes.namenode.api.app import create_app
 from server.nodes.namenode.core import Namenode
-from server.nodes.namenode.tests.helpers import add_nodes
 
 
 @pytest.fixture
@@ -29,6 +28,59 @@ class TestAuthAndAdminEndpoints:
         data = response.json()
         assert data["role"] == "leader"
         assert data["leader_id"] == "nn1"
+        assert data["node_id"] == "nn1"
+        assert data["term"] == 1
+        assert data["degraded"] is False
+
+    def test_standby_rejects_service_requests_with_leader_url(
+        self, client: TestClient, nn: Namenode
+    ):
+        nn.database = object()
+        nn._ha_enabled = True
+        nn._is_leader = False
+        nn.term = 4
+        nn.leader_id = "nn1"
+        nn.leader_url = "http://nn1:8000"
+
+        health_response = client.get("/health")
+        rejected = client.get("/v1/fs/ls", params={"path": "/users/ana"})
+
+        assert health_response.json()["role"] == "standby"
+        assert health_response.json()["status"] == "not_leader"
+        assert rejected.status_code == 503
+        assert rejected.json()["error"]["code"] == "NOT_LEADER"
+        assert rejected.json()["leader_url"] == "http://nn1:8000"
+
+    def test_degraded_leader_keeps_reads_but_rejects_metadata_writes(
+        self, client: TestClient, nn: Namenode
+    ):
+        login = client.post(
+            "/v1/auth/login",
+            json={"username": "ana", "password": "test-password"},
+        )
+        token = login.json()["access_token"]
+        nn.database = object()
+        nn._ha_enabled = True
+        nn._is_leader = True
+        nn._degraded = True
+        nn.leader_url = "http://nn1:8000"
+        nn.store.mkdir("/users/ana", "ana", nn.clock.time(), parents=True)
+
+        rejected = client.post(
+            "/v1/fs/mkdir",
+            json={"path": "/users/ana/new"},
+        )
+        read_response = client.get(
+            "/v1/fs/ls",
+            params={"path": "/users/ana"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert client.get("/health").json()["status"] == "degraded"
+        assert read_response.status_code == 200
+        assert rejected.status_code == 503
+        assert rejected.json()["error"]["code"] == "NOT_LEADER"
+        assert rejected.json()["degraded"] is True
 
     def test_register_login_and_access_protected_endpoint(self, client: TestClient):
         # Register user
@@ -99,6 +151,7 @@ class TestDataNodesAndFiles:
                 },
             )
             assert res_reg.status_code == 200
+            assert res_reg.json()["term"] == nn.term
 
         # Heartbeat
         res_hb = client.post(
@@ -106,6 +159,7 @@ class TestDataNodesAndFiles:
             json={"node_id": "dn1", "free_bytes": 9_000_000_000, "used_bytes": 1_000_000_000},
         )
         assert res_hb.status_code == 200
+        assert res_hb.json()["term"] == nn.term
 
         # User registers & prepares upload
         client.post("/v1/auth/register", json={"username": "uploader", "password": "password1234"})
@@ -131,13 +185,14 @@ class TestDataNodesAndFiles:
                 json={"node_id": f"dn{i}", "block_id": block_id, "size": 1000, "checksum": fake_checksum},
             )
             assert res_br.status_code == 200
+            assert res_br.json()["term"] == nn.term
 
         # Commit file
         res_commit = client.post(
-            "/v1/files/commit",
+            f"/v1/files/{put_data['file_id']}/commit",
             json={
-                "file_id": put_data["file_id"],
                 "blocks": [{"index": 0, "block_id": block_id, "size": 1000, "checksum": fake_checksum}],
+                "file_checksum": fake_checksum,
             },
             headers=headers,
         )
@@ -148,3 +203,33 @@ class TestDataNodesAndFiles:
         res_get = client.get("/v1/files/get?path=/users/uploader/test.txt", headers=headers)
         assert res_get.status_code == 200
         assert len(res_get.json()["blocks"]) == 1
+        assert res_get.json()["checksum"] == fake_checksum
+
+    def test_group_endpoints(self, client: TestClient):
+        client.post("/v1/auth/register", json={"username": "group-owner", "password": "password1234"})
+        owner_token = client.post(
+            "/v1/auth/login",
+            json={"username": "group-owner", "password": "password1234"},
+        ).json()["access_token"]
+        owner_headers = {"Authorization": f"Bearer {owner_token}"}
+
+        created = client.post(
+            "/v1/groups",
+            json={"name": "project-team"},
+            headers=owner_headers,
+        )
+        assert created.status_code == 201
+        assert created.json()["members"] == ["group-owner"]
+
+        client.post("/v1/auth/register", json={"username": "member", "password": "password1234"})
+        updated = client.put(
+            "/v1/groups/project-team/members",
+            json={"add": ["member"]},
+            headers=owner_headers,
+        )
+        assert updated.status_code == 200
+        assert updated.json()["members"] == ["group-owner", "member"]
+
+        fetched = client.get("/v1/groups/project-team", headers=owner_headers)
+        assert fetched.status_code == 200
+        assert fetched.json() == updated.json()

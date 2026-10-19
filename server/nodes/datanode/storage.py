@@ -91,16 +91,58 @@ class StorageManager:
             metadata.write(f"{size} {checksum} {modified_ns}\n")
         os.replace(temp_path, self.get_block_checksum_path(block_id))
 
+    def scan_blocks(self) -> list[dict[str, str | int]]:
+        """Escanear bloques definitivos (*.dat) en el almacenamiento local.
+
+        Excluye explícitamente archivos temporales (*.tmp) y sidecars (*.sha256).
+        Devuelve una lista de diccionarios con formato requerido por NameNode:
+        [{'block_id': str, 'size': int, 'checksum': str}, ...]
+        """
+        blocks: list[dict[str, str | int]] = []
+        if not os.path.exists(self.storage_dir):
+            return blocks
+
+        for filename in os.listdir(self.storage_dir):
+            if filename.endswith(".dat"):
+                block_id = filename[:-4]
+                try:
+                    size, checksum = self.get_block_info(block_id)
+                    blocks.append({
+                        "block_id": block_id,
+                        "size": size,
+                        "checksum": checksum,
+                    })
+                except (OSError, FileNotFoundError):
+                    # Si el archivo fue borrado concurrentemente o está inaccesible, se omite
+                    continue
+        return blocks
+
     def delete_block(self, block_id: str) -> bool:
-        """Elimina un bloque huérfano o corrupto del disco local."""
+        """Elimina un bloque huérfano o corrupto del disco local de forma idempotente."""
+        deleted = False
         path = self.get_block_path(block_id)
         if os.path.exists(path):
-            os.remove(path)  # elimina el archivo del sistema de archivos
-            checksum_path = self.get_block_checksum_path(block_id)
-            if os.path.exists(checksum_path):
+            try:
+                os.remove(path)
+                deleted = True
+            except OSError:
+                pass
+
+        checksum_path = self.get_block_checksum_path(block_id)
+        if os.path.exists(checksum_path):
+            try:
                 os.remove(checksum_path)
-            return True
-        return False
+            except OSError:
+                pass
+
+        temp_path = self.get_temp_block_path(block_id)
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+
+        return deleted
 
     def get_disk_usage(self) -> tuple[int, int]:
         """Calcula el espacio total y usado en disco (en bytes)."""

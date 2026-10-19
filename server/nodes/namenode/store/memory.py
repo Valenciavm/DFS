@@ -151,6 +151,59 @@ class InMemoryMetadataStore(MetadataStore):
         directory.parent.modified_at = now
         return removed
 
+    def mv(self, src: str, dst: str, now: float) -> FileMetadata | DirectoryMetadata:
+        src_segments = split_path(src)
+        dst_segments = split_path(dst)
+        if not src_segments:
+            raise DfshaError(ErrorCode.BAD_REQUEST, "cannot move root directory")
+        if not dst_segments:
+            raise DfshaError(ErrorCode.BAD_REQUEST, "cannot move to root directory")
+
+        src_canonical = join_path(src_segments)
+        dst_canonical = join_path(dst_segments)
+        if src_canonical == dst_canonical:
+            node = self.stat(src_canonical)
+            if node is None:
+                raise DfshaError(ErrorCode.FILE_NOT_FOUND, f"{src_canonical} does not exist")
+            return node
+
+        # Ensure dst is not a descendant of src if src is a directory
+        if dst_canonical.startswith(src_canonical + "/"):
+            raise DfshaError(ErrorCode.BAD_REQUEST, f"cannot move directory into itself: {dst_canonical}")
+
+        src_parent = self.resolve_dir(join_path(src_segments[:-1]))
+        dst_parent = self.resolve_dir(join_path(dst_segments[:-1]))
+        src_name = src_segments[-1]
+        dst_name = dst_segments[-1]
+
+        # Check if dst already exists
+        if dst_name in dst_parent.children or dst_name in dst_parent.files:
+            raise DfshaError(ErrorCode.ALREADY_EXISTS, f"{dst_canonical} already exists")
+
+        # Check if src is a file
+        if src_name in src_parent.files:
+            file = src_parent.files.pop(src_name)
+            file.name = dst_name
+            file.modified_at = now
+            dst_parent.files[dst_name] = file
+            self._file_dir[file.file_id] = dst_parent
+            src_parent.modified_at = now
+            dst_parent.modified_at = now
+            return file
+
+        # Check if src is a directory
+        if src_name in src_parent.children:
+            directory = src_parent.children.pop(src_name)
+            directory.name = dst_name
+            directory.parent = dst_parent
+            directory.modified_at = now
+            dst_parent.children[dst_name] = directory
+            src_parent.modified_at = now
+            dst_parent.modified_at = now
+            return directory
+
+        raise DfshaError(ErrorCode.FILE_NOT_FOUND, f"{src_canonical} does not exist")
+
     # ---- uploads ---------------------------------------------------------
 
     def get_pending(self, path: str) -> FileMetadata | None:

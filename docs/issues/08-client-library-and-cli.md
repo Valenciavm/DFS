@@ -97,7 +97,7 @@ renewal must not leave a crashed client holding a lock forever.
 Create `client/cli.py` with commands matching `API.md` Section 10:
 
 ```text
-login, apikey, ls, cd, pwd, mkdir, rmdir, rm, mv,
+login, logout, shell, apikey, ls, cd, pwd, mkdir, touch, rmdir, rm, mv,
 put, get, stat, lock, unlock, share, group
 ```
 
@@ -105,7 +105,10 @@ Use argparse/Typer/etc. consistently, return nonzero exit codes for contract
 errors, never print passwords/tokens, and provide `--namenode`/environment
 configuration. `cd` is client-side state: validate the target with `stat` and
 resolve relative paths against `/users/<username>` while sending global paths
-on the wire.
+on the wire. Support both one-shot commands and an interactive shell that keeps
+one authenticated client session alive across commands, so relative paths and
+the current directory persist until logout or exit. Prompt for the password
+once per interactive login, not once per filesystem operation.
 
 ## Tests
 
@@ -124,7 +127,7 @@ on the wire.
 
 ## Acceptance checklist
 
-- [ ] `from client import DFShaClient` works.
+- [ ] - [ ] `from client import DFShaClient` works.
 - [ ] RF1, RF2, RF3 and block-level APIs from the assignment are usable.
 - [ ] `send`/`receive` aliases are present or explicitly documented.
 - [ ] DataNode locations are resolved dynamically and hidden from callers.

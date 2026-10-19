@@ -45,15 +45,61 @@ docker compose exec -T client python -m scripts.smoke_test
 
 The smoke test logs in with `ADMIN_USER`/`ADMIN_PASSWORD`, uploads a file larger
 than one demo block, downloads it, and compares the bytes and SHA-256 checksum.
-To use the CLI interactively:
+To open the interactive client, first copy any local files you want to upload
+into the client container, then start a TTY session:
+
+```sh
+# Replace this path with a file that actually exists on your machine.
+docker compose cp ./mi-archivo.txt client:/tmp/mi-archivo.txt
+docker compose exec -it client python -m client.cli --username demo-admin shell
+```
+
+The CLI asks for the password once when the session starts, then reuses the
+authenticated client until `exit` or `logout`. On terminals with Python's
+`readline` support, arrow keys edit the command line and navigate this session's
+history. Within the prompt, use familiar commands such as `pwd`, `ls`, `cd`,
+`mkdir`, `touch`, `put`, `get`, `mv`, `rm`, `rmdir`, and `share`; relative
+DFSha paths follow the current directory. For example:
+
+```text
+dfsha:/users/demo-admin$ mkdir proyectos
+dfsha:/users/demo-admin$ cd proyectos
+dfsha:/users/demo-admin/proyectos$ pwd
+dfsha:/users/demo-admin/proyectos$ touch vacio.txt
+dfsha:/users/demo-admin/proyectos$ put /tmp/mi-archivo.txt mi-archivo.txt
+dfsha:/users/demo-admin/proyectos$ ls
+dfsha:/users/demo-admin/proyectos$ share mi-archivo.txt user:bruno r
+dfsha:/users/demo-admin/proyectos$ get mi-archivo.txt /tmp/descargado.txt
+dfsha:/users/demo-admin/proyectos$ exit
+```
+
+The commands also remain available as one-shot invocations, for example:
 
 ```sh
 docker compose exec client python -m client.cli --username demo-admin ls /users/demo-admin
 docker compose exec client python -m client.cli --username demo-admin stat /users/demo-admin/compose-smoke.bin
 ```
 
-The commands above use the `.env.example` username; replace `demo-admin` if
+These examples use the `.env.example` username; replace `demo-admin` if
 `ADMIN_USER` was changed in `.env`.
+
+The Python library also provides ranged read-only access to large files:
+
+```python
+from client import DFShaClient
+
+client = DFShaClient("http://namenode1:8000")
+try:
+    client.login("demo-admin", password)
+    with client.open("/users/demo-admin/mi-archivo.txt", lock="shared") as remote_file:
+        remote_file.seek(1024)
+        data = remote_file.read(256)
+finally:
+    client.http.close()
+```
+
+Remote files are WORM: `open()` is read-only. Create a new file or replace one
+with `put`/`put_file`; random in-place writes are not supported.
 
 The demo uses 1 MiB blocks, replication factor 3 and a two-replica commit
 quorum, with five DataNodes on the private Compose network. Their advertised

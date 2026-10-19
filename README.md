@@ -1,7 +1,7 @@
 # DFSha
 
 > [!IMPORTANT]
-> **Technical Report:** The main document of the project's technical report is available at [DFS_Informe_Tecnico.pdf](DFS_Informe_Tecnico.pdf).
+> **Technical Report:** The main document of the project's technical report is available at [DFS_Informe_Tecnico.pdf](DFSha_Informe_Tecnico_v1.0.pdf).
 
 DFSha is a block-based distributed file system with NameNode metadata services,
 DataNode block storage, and a Python client. See [the architecture](docs/ARCHITECTURE.md),

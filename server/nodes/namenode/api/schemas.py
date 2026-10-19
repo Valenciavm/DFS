@@ -235,6 +235,7 @@ class RegisterNodeResponse(BaseModel):
     status: Literal["registered"]
     heartbeat_interval_s: int
     block_report_interval_s: int
+    term: int = 1
 
 
 class HeartbeatRequest(BaseModel):
@@ -251,6 +252,7 @@ class NodeCommandSchema(BaseModel):
 
 
 class HeartbeatResponse(BaseModel):
+    term: int = 1
     commands: list[NodeCommandSchema]
 
 
@@ -267,6 +269,7 @@ class BlockReportRequest(BaseModel):
 
 class BlockReportResponse(BaseModel):
     status: Literal["ok"]
+    term: int = 1
     commands: list[NodeCommandSchema]
 
 
@@ -284,7 +287,7 @@ class BlockReceivedResponse(BaseModel):
 class BlockCorruptRequest(BaseModel):
     node_id: str
     block_id: str
-    reason: str
+    reason: str | None = None
 
 
 class BlockCorruptResponse(BaseModel):

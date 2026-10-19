@@ -51,6 +51,7 @@ async def register_datanode(
         status="registered",
         heartbeat_interval_s=nn.settings.heartbeat_interval_s,
         block_report_interval_s=nn.settings.block_report_interval_s,
+        term=nn.term,
     )
 
 
@@ -65,6 +66,7 @@ async def heartbeat(
         used_bytes=req.used_bytes,
     )
     return HeartbeatResponse(
+        term=nn.term,
         commands=[_to_command_schema(cmd) for cmd in commands]
     )
 
@@ -86,6 +88,7 @@ async def block_report(
     )
     return BlockReportResponse(
         status="ok",
+        term=nn.term,
         commands=[_to_command_schema(cmd) for cmd in commands],
     )
 

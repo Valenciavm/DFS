@@ -97,6 +97,16 @@ def test_share_maps_to_acl_update():
     client.set_acl.assert_called_once_with("report.txt", "user:bruno", "r")
 
 
+def test_group_create_calls_client_api():
+    client = Mock()
+
+    with patch.object(cli, "DFShaClient", return_value=client):
+        result = cli.main(["--api-key", "dfsha_live_test", "group", "team", "--create"])
+
+    assert result == 0
+    client.create_group.assert_called_once_with("team")
+
+
 def test_posix_prompt_supports_up_arrow_history(monkeypatch, capsys):
     import os
     import sys

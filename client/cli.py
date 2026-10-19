@@ -61,6 +61,7 @@ def _add_commands(parser):
     command.add_argument("lock_id")
     command = commands.add_parser("group", help="Show or update a group")
     command.add_argument("name")
+    command.add_argument("--create", action="store_true")
     command.add_argument("--add", nargs="*", default=[])
     command.add_argument("--remove", nargs="*", default=[])
     command = commands.add_parser("apikey", help="Manage API keys")
@@ -145,6 +146,12 @@ def _execute(client, args):
     if args.cmd == "unlock":
         return client.unlock(args.lock_id)
     if args.cmd == "group":
+        if args.create:
+            if args.add or args.remove:
+                raise ValueError(
+                    "group --create cannot be combined with --add or --remove"
+                )
+            return client.create_group(args.name)
         if args.add or args.remove:
             return client.add_members(args.name, args.add, args.remove)
         return client.group_info(args.name)

@@ -12,6 +12,7 @@ from urllib.parse import quote
 import grpc
 
 from .exceptions import DFShaError, IntegrityError, MFARequired
+from .file import DFSFile
 from .http import NameNodeHTTP
 from .transfer import GrpcBlockTransport
 
@@ -576,6 +577,38 @@ class DFShaClient:
             except OSError:
                 logger.exception("Unable to remove incomplete download %s", temp)
             raise
+
+    def open(self, remote_path, mode="rb", lock=None, lock_ttl_s=60):
+        """Open a read-only DFSha file handle; writes use WORM uploads via put_file."""
+        if mode != "rb":
+            raise NotImplementedError(
+                "DFSha files are WORM; open() supports 'rb' only. "
+                "Create or replace content with put_file()."
+            )
+        if lock not in {None, "shared", "exclusive"}:
+            raise ValueError("lock must be None, 'shared', or 'exclusive'")
+
+        remote = self.resolve_path(remote_path)
+        lock_id = None
+        if lock is not None:
+            lock_response = self.lock(remote, mode=lock, ttl_s=lock_ttl_s)
+            lock_id = lock_response["lock_id"]
+        try:
+            manifest = self.http.request(
+                "GET",
+                "/v1/files/get",
+                params={"path": remote},
+            )
+        except Exception:
+            if lock_id is not None:
+                try:
+                    self.unlock(lock_id)
+                except DFShaError:
+                    logger.exception(
+                        "Unable to release lock %s after open failed", lock_id
+                    )
+            raise
+        return DFSFile(self, manifest, lock_id=lock_id)
 
     def send(self, local_path, remote_path, overwrite=False):
         """Alias for uploading a local file to DFSha."""

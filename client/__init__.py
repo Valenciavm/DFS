@@ -7,10 +7,12 @@ from .exceptions import (
     MFARequired,
     TransferNotConfiguredError,
 )
+from .file import DFSFile
 
 __all__ = [
     "APIError",
     "AuthenticationError",
+    "DFSFile",
     "DFShaClient",
     "DFShaError",
     "IntegrityError",

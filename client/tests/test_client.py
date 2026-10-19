@@ -68,6 +68,24 @@ class ClientTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.client.set_acl("/x", "user:a", "bad")
 
+    def test_open_uses_read_manifest_and_releases_optional_lock(self):
+        self.client.http.request.return_value = {
+            "size": 0,
+            "blocks": [],
+        }
+        self.client.lock = Mock(return_value={"lock_id": "lock-1"})
+        self.client.unlock = Mock()
+
+        with self.client.open("empty.txt", lock="shared") as remote_file:
+            self.assertEqual(remote_file.read(), b"")
+
+        self.client.lock.assert_called_once_with("/empty.txt", mode="shared", ttl_s=60)
+        self.client.unlock.assert_called_once_with("lock-1")
+
+    def test_open_rejects_write_modes_for_worm_files(self):
+        with self.assertRaisesRegex(NotImplementedError, "WORM"):
+            self.client.open("file.txt", mode="wb")
+
     def test_upload_uses_path_commit_and_checksum(self):
         payload = b"dfs"
         checksum = hashlib.sha256(payload).hexdigest()

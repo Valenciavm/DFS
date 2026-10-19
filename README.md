@@ -86,6 +86,10 @@ en otra terminal:
 docker compose exec -T client python -c "from pathlib import Path; Path('/tmp/demo.txt').write_text('archivo de prueba DFSha\n')"
 ```
 
+Este archivo local `/tmp/demo.txt` es el contenido que subirá `put`. En cambio,
+`touch vacio.txt` crea un archivo DFSha remoto vacío en el directorio remoto
+actual; no crea ni prepara `/tmp/demo.txt`.
+
 Ahora ejecuta esta secuencia dentro de la sesión interactiva, después del
 indicador `dfsha:...$`:
 
@@ -112,6 +116,16 @@ acl renombrado.txt group:equipo rw
 share renombrado.txt group:equipo r
 lock renombrado.txt --mode exclusive --ttl 60
 ```
+
+El primer `put` debe mostrar un resultado JSON con `"status": "committed"` y
+crear `subida.txt` en el directorio remoto actual. El segundo comando vuelve a
+subir el mismo contenido, esta vez solicitando explícitamente reemplazar el
+archivo existente. `ls` debe mostrar `subida.txt`; después de `mv`, debe
+mostrar `renombrado.txt`. Si `get` responde `FILE_NOT_FOUND`, comprueba que el
+`put` anterior mostró `"status": "committed"` y que `ls` lista el archivo. Si
+tu imagen no muestra el resultado del `put`, reconstruye y recrea el cliente
+con `docker compose build client` y `docker compose up -d --no-deps client`,
+vuelve a abrir el shell y repite la prueba.
 
 `lock` imprime un objeto JSON con un `lock_id`. Copia ese valor y úsalo para
 liberar el lock:

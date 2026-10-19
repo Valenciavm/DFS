@@ -742,6 +742,9 @@ class PostgresMetadataStore(MetadataStore):
 
     def commit_file(self, file_id: str, now: float) -> FileMetadata | None:
         file_uuid = _file_uuid(file_id)
+        file_metadata = self._cache.get_file_by_id(file_id)
+        if file_metadata is None:
+            raise KeyError(f"unknown file_id {file_id}")
 
         def commit(connection: Connection[Row]) -> FileMetadata | None:
             row = connection.execute(
@@ -768,10 +771,18 @@ class PostgresMetadataStore(MetadataStore):
                     "DELETE FROM files WHERE file_id = %s", (inode["current_file_id"],)
                 )
             connection.execute(
-                "UPDATE files SET status = 'COMMITTED', expires_at = NULL, modified_at = %s "
-                "WHERE file_id = %s",
-                (_to_timestamp(now), file_uuid),
+                "UPDATE files SET status = 'COMMITTED', checksum = %s, expires_at = NULL, "
+                "modified_at = %s WHERE file_id = %s",
+                (file_metadata.checksum, _to_timestamp(now), file_uuid),
             )
+            with connection.cursor() as cursor:
+                cursor.executemany(
+                    "UPDATE blocks SET checksum = %s WHERE file_id = %s AND block_id = %s",
+                    [
+                        (block.checksum, file_uuid, block.block_id)
+                        for block in file_metadata.blocks
+                    ],
+                )
             connection.execute(
                 "UPDATE inodes SET current_file_id = %s, modified_at = %s WHERE id = %s",
                 (file_uuid, _to_timestamp(now), inode["id"]),

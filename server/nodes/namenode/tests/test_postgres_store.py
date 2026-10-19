@@ -170,8 +170,11 @@ def test_overwrite_is_atomic_and_returns_the_replaced_metadata(postgres_database
 def test_snapshot_restores_directories_files_blocks_and_statuses(postgres_database):
     store = new_store(postgres_database)
     store.mkdir("/users/ana/docs/nested", "ana", T0, parents=True)
+    committed = make_file("committed", "committed")
+    committed.checksum = "a" * 64
+    committed.blocks[0].checksum = "b" * 64
     store.create_pending_file(
-        "/users/ana/docs/nested/committed", make_file("committed", "committed")
+        "/users/ana/docs/nested/committed", committed
     )
     store.commit_file("committed", T0 + 1)
     store.create_pending_file(
@@ -185,7 +188,10 @@ def test_snapshot_restores_directories_files_blocks_and_statuses(postgres_databa
     restarted = PostgresMetadataStore(postgres_database, now=T0 + 3)
 
     assert restarted.resolve_dir("/users/ana/docs/nested").path() == "/users/ana/docs/nested"
-    assert restarted.get_file("/users/ana/docs/nested/committed").file_id == "committed"
+    restored = restarted.get_file("/users/ana/docs/nested/committed")
+    assert restored.file_id == "committed"
+    assert restored.checksum == "a" * 64
+    assert restored.blocks[0].checksum == "b" * 64
     assert restarted.get_pending("/users/ana/docs/nested/pending").file_id == "pending"
     assert restarted.get_file_by_id("aborted").status is FileStatus.ABORTED
     assert restarted.file_of_block("blk_aborted_0").status is FileStatus.ABORTED

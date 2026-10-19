@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import logging
 
 import httpx
 import pytest
@@ -108,6 +109,43 @@ async def test_datanode_ignores_stale_commands_and_reports_on_new_terms(
     with pytest.raises(FileNotFoundError):
         dn.storage.get_block_info("current-block")
     assert dn._full_report_event.is_set()
+
+
+@pytest.mark.asyncio
+async def test_replication_command_failure_is_logged_and_task_is_retrieved(
+    tmp_path, caplog
+):
+    dn = DataNode(node_id="dn-source", storage_dir=str(tmp_path))
+
+    async def fail_replication(block_id, target_address, token=None):
+        raise RuntimeError("connection refused")
+
+    dn.replicate_block_to_node = fail_replication
+
+    with caplog.at_level(logging.WARNING, logger="server.nodes.datanode.core"):
+        await dn.handle_commands(
+            [
+                {
+                    "cmd": "replicate",
+                    "block_id": "blk-failed",
+                    "targets": ["dn-target:9001"],
+                }
+            ]
+        )
+        tasks = list(dn._replication_tasks)
+        assert len(tasks) == 1
+        await asyncio.gather(*tasks)
+        await asyncio.sleep(0)
+
+    assert not dn._replication_tasks
+    assert "connection refused" in caplog.text
+    assert "NameNode will retry if no copy is confirmed" in caplog.text
+    failure_record = next(
+        record for record in caplog.records if "failed to replicate block" in record.message
+    )
+    assert failure_record.levelno == logging.WARNING
+    assert failure_record.exc_info is None
+    await dn.close()
 
 
 @pytest.mark.asyncio

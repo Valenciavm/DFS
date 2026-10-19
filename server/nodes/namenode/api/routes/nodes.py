@@ -1,4 +1,5 @@
 """DataNode facing routes: /v1/nodes/*."""
+
 from __future__ import annotations
 
 from typing import Annotated
@@ -25,17 +26,24 @@ from server.nodes.namenode.core import Namenode
 router = APIRouter()
 
 
-def _to_command_schema(cmd: Command, term: int) -> NodeCommandSchema:
+def _to_command_schema(cmd: Command, term: int, nn: Namenode) -> NodeCommandSchema:
+    targets = [
+        nn.cluster.datanodes[target_id].internal_addr
+        for target_id in cmd.targets
+        if target_id in nn.cluster.datanodes
+    ]
     return NodeCommandSchema(
         cmd=cmd.cmd,
         block_id=cmd.block_id,
         term=term,
-        targets=cmd.targets if cmd.targets else None,
+        targets=targets if targets else None,
         token=cmd.token if cmd.token else None,
     )
 
 
-@router.post("/register", status_code=status.HTTP_200_OK, response_model=RegisterNodeResponse)
+@router.post(
+    "/register", status_code=status.HTTP_200_OK, response_model=RegisterNodeResponse
+)
 async def register_datanode(
     req: RegisterNodeRequest,
     nn: Annotated[Namenode, Depends(get_namenode)],
@@ -56,7 +64,9 @@ async def register_datanode(
     )
 
 
-@router.post("/heartbeat", status_code=status.HTTP_200_OK, response_model=HeartbeatResponse)
+@router.post(
+    "/heartbeat", status_code=status.HTTP_200_OK, response_model=HeartbeatResponse
+)
 async def heartbeat(
     req: HeartbeatRequest,
     nn: Annotated[Namenode, Depends(get_namenode)],
@@ -68,11 +78,13 @@ async def heartbeat(
     )
     return HeartbeatResponse(
         term=nn.term,
-        commands=[_to_command_schema(cmd, nn.term) for cmd in commands]
+        commands=[_to_command_schema(cmd, nn.term, nn) for cmd in commands],
     )
 
 
-@router.post("/block-report", status_code=status.HTTP_200_OK, response_model=BlockReportResponse)
+@router.post(
+    "/block-report", status_code=status.HTTP_200_OK, response_model=BlockReportResponse
+)
 async def block_report(
     req: BlockReportRequest,
     nn: Annotated[Namenode, Depends(get_namenode)],
@@ -90,11 +102,15 @@ async def block_report(
     return BlockReportResponse(
         status="ok",
         term=nn.term,
-        commands=[_to_command_schema(cmd, nn.term) for cmd in commands],
+        commands=[_to_command_schema(cmd, nn.term, nn) for cmd in commands],
     )
 
 
-@router.post("/block-received", status_code=status.HTTP_200_OK, response_model=BlockReceivedResponse)
+@router.post(
+    "/block-received",
+    status_code=status.HTTP_200_OK,
+    response_model=BlockReceivedResponse,
+)
 async def block_received(
     req: BlockReceivedRequest,
     nn: Annotated[Namenode, Depends(get_namenode)],
@@ -108,7 +124,11 @@ async def block_received(
     return BlockReceivedResponse(status="ok", term=nn.term)
 
 
-@router.post("/block-corrupt", status_code=status.HTTP_200_OK, response_model=BlockCorruptResponse)
+@router.post(
+    "/block-corrupt",
+    status_code=status.HTTP_200_OK,
+    response_model=BlockCorruptResponse,
+)
 async def block_corrupt(
     req: BlockCorruptRequest,
     nn: Annotated[Namenode, Depends(get_namenode)],

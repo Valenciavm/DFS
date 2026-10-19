@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import uuid
 from typing import Any
@@ -18,6 +19,7 @@ from server.nodes.datanode.storage import StorageManager
 DEFAULT_NAMENODE_URLS = os.getenv("NAMENODE_URLS", os.getenv("NAMENODE_URL", "http://localhost:8000"))
 DEFAULT_HEARTBEAT_INTERVAL = 5
 DEFAULT_BLOCK_REPORT_INTERVAL = 60
+logger = logging.getLogger(__name__)
 
 
 class DataNode:
@@ -69,6 +71,7 @@ class DataNode:
         self.is_registered: bool = False
         self._stop_event = asyncio.Event()
         self._full_report_event = asyncio.Event()
+        self._replication_tasks: set[asyncio.Task[None]] = set()
 
         # Outbox for unacknowledged block receipts
         self._pending_block_receipts: asyncio.Queue[tuple[str, int, str]] = asyncio.Queue()
@@ -173,6 +176,11 @@ class DataNode:
         self._stop_event.set()
         if self.grpc_server is not None:
             await self.grpc_server.stop(grace=1.0)
+        replication_tasks = list(self._replication_tasks)
+        for task in replication_tasks:
+            task.cancel()
+        if replication_tasks:
+            await asyncio.gather(*replication_tasks, return_exceptions=True)
         if not self._custom_client:
             await self._http_client.aclose()
 
@@ -215,7 +223,7 @@ class DataNode:
                 if commands:
                     await self.handle_commands(commands)
             except Exception as e:  # noqa: BLE001
-                print(f"[DataNode {self.node_id}] Error enviando heartbeat: {e}")
+                logger.warning("DataNode %s heartbeat failed: %s", self.node_id, e)
 
             try:
                 await asyncio.wait_for(self._stop_event.wait(), timeout=self.heartbeat_interval_s)
@@ -259,7 +267,7 @@ class DataNode:
 
                 await self.send_block_report()
             except Exception as e:  # noqa: BLE001
-                print(f"[DataNode {self.node_id}] Error enviando block report: {e}")
+                logger.warning("DataNode %s block report failed: %s", self.node_id, e)
 
     async def notify_block_received(self, block_id: str, size: int, checksum: str) -> None:
         """Notifica al NameNode que un bloque ha sido completado y verificado."""
@@ -285,7 +293,12 @@ class DataNode:
         try:
             await self._post("/v1/nodes/block-corrupt", payload, max_retries=2)
         except Exception as e:
-            print(f"[DataNode {self.node_id}] Error notificando bloque corrupto {block_id}: {e}")
+            logger.warning(
+                "DataNode %s failed to notify NameNode about corrupt block %s: %s",
+                self.node_id,
+                block_id,
+                e,
+            )
 
     async def outbox_flush_loop(self):
         """Reintenta notificaciones de block-received pendientes en caso de fallos transitorios."""
@@ -333,13 +346,37 @@ class DataNode:
                 for target in targets:
                     target_addr = target if isinstance(target, str) else target.get("internal_addr")
                     if target_addr:
-                        asyncio.create_task(
-                            self.replicate_block_to_node(block_id, target_addr, token=token)
+                        task = asyncio.create_task(
+                            self._replicate_with_error_handling(block_id, target_addr, token)
                         )
+                        self._replication_tasks.add(task)
+                        task.add_done_callback(self._replication_tasks.discard)
             elif action == "delete":
                 self.storage.delete_block(block_id)
             else:
-                print(f"[DataNode {self.node_id}] Comando desconocido ignorado: {action}")
+                logger.warning(
+                    "DataNode %s ignored unknown command %s for block %s",
+                    self.node_id,
+                    action,
+                    block_id,
+                )
+
+    async def _replicate_with_error_handling(
+        self, block_id: str, target_address: str, token: str | None
+    ) -> None:
+        try:
+            await self.replicate_block_to_node(block_id, target_address, token=token)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "DataNode %s failed to replicate block %s to %s: %s; "
+                "the NameNode will retry if no copy is confirmed",
+                self.node_id,
+                block_id,
+                target_address,
+                exc,
+            )
 
     # -------------------------------------------------------------------------
     # Servidor gRPC de Bloques y Pipeline
@@ -357,9 +394,11 @@ class DataNode:
         self.grpc_server.add_insecure_port(f"{self.grpc_host}:{self.grpc_port}")
 
         await self.grpc_server.start()
-        print(
-            f"[DataNode {self.node_id}] Servidor gRPC activo en {self.address} "
-            f"(Almacenamiento: {self.storage.storage_dir})"
+        logger.info(
+            "DataNode %s gRPC server listening at %s (storage: %s)",
+            self.node_id,
+            self.address,
+            self.storage.storage_dir,
         )
         await self.grpc_server.wait_for_termination()
 
@@ -369,7 +408,13 @@ class DataNode:
         """Envía una copia de un bloque local hacia otro DataNode por gRPC."""
         size, checksum = self.storage.get_block_info(block_id)
 
-        print(f"[DataNode {self.node_id}] Replicando {block_id} ({size} bytes) -> {target_address}...")
+        logger.debug(
+            "DataNode %s replicating block %s (%d bytes) to %s",
+            self.node_id,
+            block_id,
+            size,
+            target_address,
+        )
 
         # TODO(security): replace the insecure channel with TLS (API.md 2.3)
         async with grpc.aio.insecure_channel(target_address) as channel:
@@ -389,8 +434,11 @@ class DataNode:
 
             metadata = (("x-block-token", token),) if token is not None else ()
             resp = await stub.WriteBlock(generate_requests(), metadata=metadata)
-            print(
-                f"[DataNode {self.node_id}] Réplica de {block_id} en {target_address} "
-                f"confirmada: SHA {resp.checksum_sha256[:8]}..."
+            logger.info(
+                "DataNode %s replicated block %s to %s (SHA %s...)",
+                self.node_id,
+                block_id,
+                target_address,
+                resp.checksum_sha256[:8],
             )
             return resp

@@ -5,6 +5,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from server.nodes.namenode.api.app import create_app
+from server.nodes.namenode.cluster_state import Command
 from server.nodes.namenode.core import Namenode
 
 
@@ -137,6 +138,23 @@ class TestFilesystemAndLocks:
 
 
 class TestDataNodesAndFiles:
+    def test_heartbeat_replication_targets_use_internal_addresses(
+        self, client: TestClient, nn: Namenode
+    ):
+        nn.register_datanode("source", "source:9001", "source:9001", 100)
+        nn.register_datanode("target", "target:9002", "target:9002", 100)
+        nn.cluster.pending_commands["source"] = [
+            Command("replicate", "blk-repair", ["target"], "token")
+        ]
+
+        response = client.post(
+            "/v1/nodes/heartbeat",
+            json={"node_id": "source", "free_bytes": 100, "used_bytes": 0},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["commands"][0]["targets"] == ["target:9002"]
+
     def test_datanode_lifecycle_and_file_put(self, client: TestClient, nn: Namenode):
         # Register DataNodes
         for i in range(1, 4):

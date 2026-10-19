@@ -95,6 +95,13 @@ class MetadataStore(ABC):
         whenever an upload is in progress anywhere below it.
         """
 
+    @abstractmethod
+    def mv(self, src: str, dst: str, now: float) -> FileMetadata | DirectoryMetadata:
+        """Moves a committed file or directory from ``src`` to ``dst``.
+
+        Only changes metadata; blocks are not copied.
+        """
+
     # ---- uploads ---------------------------------------------------------
 
     @abstractmethod

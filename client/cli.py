@@ -11,11 +11,6 @@ from pathlib import Path
 
 from . import DFShaClient, DFShaError, MFARequired
 
-try:
-    import readline
-except ImportError:
-    readline = None
-
 
 def _add_commands(parser):
     commands = parser.add_subparsers(dest="cmd")
@@ -180,13 +175,15 @@ def _print_result(result, command, *, interactive=False):
 
 
 def _interactive(client, *, input_fn=None):
-    input_fn = input if input_fn is None else input_fn
-    if readline is not None:
-        readline.parse_and_bind("set editing-mode emacs")
+    history = []
     print("DFSha interactive client. Type 'help' for commands; 'exit' to quit.")
     while True:
         try:
-            line = input_fn(f"dfsha:{client.pwd()}$ ")
+            line = _read_command(
+                f"dfsha:{client.pwd()}$ ",
+                history,
+                input_fn=input_fn,
+            )
         except EOFError:
             print()
             return 0
@@ -201,6 +198,8 @@ def _interactive(client, *, input_fn=None):
             continue
         if not parts:
             continue
+        if history is not None and (not history or history[-1] != line):
+            history.append(line)
         if parts[0] in {"exit", "quit"}:
             return 0
         if parts[0] == "help":
@@ -216,6 +215,125 @@ def _interactive(client, *, input_fn=None):
             continue
         except (DFShaError, OSError, ValueError) as error:
             print(str(error), file=sys.stderr)
+
+
+def _read_command(prompt, history, *, input_fn=None):
+    if input_fn is not None:
+        return input_fn(prompt)
+    if os.name != "nt" and sys.stdin.isatty():
+        return _read_tty_command(prompt, history)
+    return input(prompt)
+
+
+def _read_tty_command(prompt, history):
+    import select
+    import termios
+    import tty
+
+    fd = sys.stdin.fileno()
+    original_settings = termios.tcgetattr(fd)
+    line = ""
+    cursor = 0
+    history_index = len(history)
+    draft = ""
+
+    def redraw():
+        sys.stdout.write(f"\r\033[2K{prompt}{line}")
+        if cursor < len(line):
+            sys.stdout.write(f"\033[{len(line) - cursor}D")
+        sys.stdout.flush()
+
+    def read_escape_byte():
+        ready, _, _ = select.select([fd], [], [], 0.05)
+        return os.read(fd, 1) if ready else b""
+
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+    try:
+        tty.setraw(fd)
+        while True:
+            value = os.read(fd, 1)
+            if not value:
+                raise EOFError
+            if value in {b"\r", b"\n"}:
+                sys.stdout.write("\r\n")
+                sys.stdout.flush()
+                return line
+            if value == b"\x03":
+                sys.stdout.write("^C\r\n")
+                sys.stdout.flush()
+                raise KeyboardInterrupt
+            if value == b"\x04":
+                if not line:
+                    raise EOFError
+                continue
+            if value == b"\x1b":
+                if read_escape_byte() != b"[":
+                    continue
+                direction = read_escape_byte()
+                if direction == b"A" and history:
+                    if history_index == len(history):
+                        draft = line
+                    history_index = max(0, history_index - 1)
+                    line = history[history_index]
+                    cursor = len(line)
+                    redraw()
+                elif direction == b"B" and history_index < len(history):
+                    history_index += 1
+                    line = (
+                        draft
+                        if history_index == len(history)
+                        else history[history_index]
+                    )
+                    cursor = len(line)
+                    redraw()
+                elif direction == b"C" and cursor < len(line):
+                    cursor += 1
+                    sys.stdout.write("\033[C")
+                    sys.stdout.flush()
+                elif direction == b"D" and cursor:
+                    cursor -= 1
+                    sys.stdout.write("\033[D")
+                    sys.stdout.flush()
+                continue
+            if value in {b"\x7f", b"\x08"}:
+                if cursor:
+                    line = line[: cursor - 1] + line[cursor:]
+                    cursor -= 1
+                    redraw()
+                continue
+            if value == b"\x01":
+                cursor = 0
+                redraw()
+                continue
+            if value == b"\x05":
+                cursor = len(line)
+                redraw()
+                continue
+            if value == b"\x15":
+                line = ""
+                cursor = 0
+                redraw()
+                continue
+            if value[0] >= 32:
+                continuation_bytes = (
+                    1
+                    if 0xC2 <= value[0] <= 0xDF
+                    else 2
+                    if 0xE0 <= value[0] <= 0xEF
+                    else 3
+                    if 0xF0 <= value[0] <= 0xF4
+                    else 0
+                )
+                encoded = value + b"".join(
+                    os.read(fd, 1) for _ in range(continuation_bytes)
+                )
+                character = encoded.decode("utf-8", errors="replace")
+                line = line[:cursor] + character + line[cursor:]
+                cursor += len(character)
+                redraw()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, original_settings)
 
 
 def main(argv=None):

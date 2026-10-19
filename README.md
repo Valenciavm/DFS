@@ -15,7 +15,7 @@ DataNode block storage, and a Python client. See [the architecture](docs/ARCHITE
 > in [issue 07](docs/issues/07-security-tls-and-encryption.md); this Compose setup
 > does not close that issue or qualify for production/cloud deployment.
 
-Prerequisites: Docker Desktop with the Compose plugin, and Python 3.13 if running
+Prerequisites: Docker with the Compose plugin, and Python 3.13 if running
 the client from the host. The Compose client container already has the pinned
 dependencies installed.
 
@@ -98,8 +98,18 @@ finally:
     client.http.close()
 ```
 
-Remote files are WORM: `open()` is read-only. Create a new file or replace one
-with `put`/`put_file`; random in-place writes are not supported.
+For sequential WORM creation or replacement, open in binary write mode; bytes
+are staged locally and uploaded when the handle closes:
+
+```python
+with client.open("/users/demo-admin/generated.bin", "wb") as remote_file:
+    remote_file.write(b"first part")
+    remote_file.write(b" and second part")
+```
+
+Remote files do not support random in-place updates. `open()` reads by range and
+`open(..., "wb")` writes a new complete version on close; use `put_file()` for
+whole local files.
 
 The demo uses 1 MiB blocks, replication factor 3 and a two-replica commit
 quorum, with five DataNodes on the private Compose network. Their advertised

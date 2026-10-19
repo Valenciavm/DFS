@@ -1,3 +1,4 @@
+import types
 from unittest.mock import Mock, patch
 
 from client import cli
@@ -94,3 +95,30 @@ def test_share_maps_to_acl_update():
 
     assert result == 0
     client.set_acl.assert_called_once_with("report.txt", "user:bruno", "r")
+
+
+def test_posix_prompt_supports_up_arrow_history(monkeypatch, capsys):
+    import os
+    import sys
+
+    if os.name == "nt":
+        return
+
+    keys = iter([b"\x1b", b"[", b"A", b"\r"])
+    fake_termios = types.SimpleNamespace(
+        TCSADRAIN=0,
+        tcgetattr=Mock(return_value=[]),
+        tcsetattr=Mock(),
+    )
+    fake_tty = types.SimpleNamespace(setraw=Mock())
+    fake_select = types.SimpleNamespace(select=lambda *_args, **_kwargs: ([42], [], []))
+    monkeypatch.setitem(sys.modules, "termios", fake_termios)
+    monkeypatch.setitem(sys.modules, "tty", fake_tty)
+    monkeypatch.setitem(sys.modules, "select", fake_select)
+    monkeypatch.setattr(cli.sys, "stdin", types.SimpleNamespace(fileno=lambda: 42))
+    monkeypatch.setattr(cli.os, "read", lambda _fd, _size: next(keys))
+
+    assert cli._read_tty_command("dfsha$ ", ["pwd"]) == "pwd"
+    fake_tty.setraw.assert_called_once_with(42)
+    fake_termios.tcsetattr.assert_called_once_with(42, 0, [])
+    assert "\x1b[2Kdfsha$ pwd" in capsys.readouterr().out

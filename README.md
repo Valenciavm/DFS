@@ -55,9 +55,10 @@ docker compose exec -it client python -m client.cli --username demo-admin shell
 ```
 
 The CLI asks for the password once when the session starts, then reuses the
-authenticated client until `exit` or `logout`. On terminals with Python's
-`readline` support, arrow keys edit the command line and navigate this session's
-history. Within the prompt, use familiar commands such as `pwd`, `ls`, `cd`,
+authenticated client until `exit` or `logout`. On POSIX terminals, the built-in
+line editor supports arrow keys, cursor movement, and command history; on
+Windows, input uses the standard terminal prompt. Within the prompt, use
+familiar commands such as `pwd`, `ls`, `cd`,
 `mkdir`, `touch`, `put`, `get`, `mv`, `rm`, `rmdir`, and `share`; relative
 DFSha paths follow the current directory. For example:
 

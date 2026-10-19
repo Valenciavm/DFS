@@ -1,4 +1,4 @@
-"""Random-access, read-only handle for a DFSha file."""
+"""Read-only range and sequential write handles for DFSha files."""
 
 import logging
 import os

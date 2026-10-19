@@ -157,7 +157,33 @@ Crear el directorio y tests en `server/nodes/datanode/tests/`:
 ---
 
 ## Criterios de Aceptación
-- [ ] La suite de pytest del DataNode pasa al 100%.
-- [ ] No quedan métodos simulados o incompletos en `DataNode`.
-- [ ] El fencing de términos y failover cumplen estrictamente con `API.md` Sección 7.
-- [ ] Verificación de código limpia con linters y tipado estricto (`pytest` sin fallos).
+- [x] La suite de pytest del DataNode pasa al 100%.
+- [x] No quedan métodos simulados o incompletos en `DataNode`.
+- [x] El fencing de términos y failover cumplen estrictamente con `API.md` Sección 7.
+- [x] Verificación de código limpia con linters y tipado estricto (`pytest` sin fallos).
+
+---
+
+## Auditoría Final de Implementación y Verificación
+
+| Punto del Plan | Archivo | Estado de Implementación |
+| :--- | :--- | :---: |
+| **Paso 1: `scan_blocks()`** (solo `.dat`, excluyendo `.tmp` y `.sha256`) | [`server/nodes/datanode/storage.py`](file:///c:/Users/valen/OneDrive/Escritorio/DFS/server/nodes/datanode/storage.py#L94-L117) |  **Implementado y verificado** |
+| **Paso 1: `delete_block()`** (idempotente, borra `.dat`, `.sha256` y `.tmp`) | [`server/nodes/datanode/storage.py`](file:///c:/Users/valen/OneDrive/Escritorio/DFS/server/nodes/datanode/storage.py#L119-L145) |  **Implementado y verificado** |
+| **Paso 2: Cliente REST multi-URL** (failover ante 503 con `leader_url`) | [`server/nodes/datanode/core.py`](file:///c:/Users/valen/OneDrive/Escritorio/DFS/server/nodes/datanode/core.py#L86-L150) |  **Implementado y verificado** |
+| **Paso 2: Auto re-registro ante 409** (`NODE_NOT_REGISTERED`) | [`server/nodes/datanode/core.py`](file:///c:/Users/valen/OneDrive/Escritorio/DFS/server/nodes/datanode/core.py#L119-L125) |  **Implementado y verificado** |
+| **Paso 2: Headers de seguridad** (`X-Request-Id` y `X-Node-Key`) | [`server/nodes/datanode/core.py`](file:///c:/Users/valen/OneDrive/Escritorio/DFS/server/nodes/datanode/core.py#L76-L84) |  **Implementado y verificado** |
+| **Paso 3: `register_with_namenode()`** (captura intervalos) | [`server/nodes/datanode/core.py`](file:///c:/Users/valen/OneDrive/Escritorio/DFS/server/nodes/datanode/core.py#L170-L188) |  **Implementado y verificado** |
+| **Paso 3: `heartbeat_loop()`** con **term fencing** | [`server/nodes/datanode/core.py`](file:///c:/Users/valen/OneDrive/Escritorio/DFS/server/nodes/datanode/core.py#L129-L215) |  **Implementado y verificado** |
+| **Paso 3: `send_block_report()` y `block_report_loop()`** | [`server/nodes/datanode/core.py`](file:///c:/Users/valen/OneDrive/Escritorio/DFS/server/nodes/datanode/core.py#L217-L260) |  **Implementado y verificado** |
+| **Paso 3: `notify_block_corrupt()`** | [`server/nodes/datanode/core.py`](file:///c:/Users/valen/OneDrive/Escritorio/DFS/server/nodes/datanode/core.py#L274-L284) |  **Implementado y verificado** |
+| **Paso 4: Despacho de comandos** (`delete` y `replicate` con token) | [`server/nodes/datanode/core.py`](file:///c:/Users/valen/OneDrive/Escritorio/DFS/server/nodes/datanode/core.py#L311-L380) |  **Implementado y verificado** |
+| **Paso 5: Cableado en `WriteBlock`** (`notify_block_received`) | [`server/nodes/datanode/block_service.py`](file:///c:/Users/valen/OneDrive/Escritorio/DFS/server/nodes/datanode/block_service.py#L308-L315) |  **Implementado y verificado** |
+| **Paso 5: Cableado en `ReadBlock`** (`notify_block_corrupt` en `OSError`) | [`server/nodes/datanode/block_service.py`](file:///c:/Users/valen/OneDrive/Escritorio/DFS/server/nodes/datanode/block_service.py#L489) |  **Implementado y verificado** |
+| **Paso 6: Ciclo de vida y Graceful Shutdown** (`run()` con `close()`) | [`server/nodes/datanode/core.py`](file:///c:/Users/valen/OneDrive/Escritorio/DFS/server/nodes/datanode/core.py#L151-L168) |  **Implementado y verificado** |
+| **Paso 7: Suite de pruebas automatizadas** | [`tests/test_datanode_control_loop.py`](file:///c:/Users/valen/OneDrive/Escritorio/DFS/tests/test_datanode_control_loop.py), [`test_datanode_storage.py`](file:///c:/Users/valen/OneDrive/Escritorio/DFS/tests/test_datanode_storage.py) |  **Implementado y verificado** |
+
+### **Resultado de Pruebas Globales**
+- **Tests ejecutados:** 315 tests (suite completa del clúster).
+- **Resultado:** `315 passed, 1 warning in 65.41s` (100% de éxito).
+

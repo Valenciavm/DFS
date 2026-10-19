@@ -1,5 +1,8 @@
 # DFSha
 
+> [!IMPORTANT]
+> 📄 **Informe Técnico:** El documento principal del informe técnico del proyecto se encuentra disponible en [DFS_Informe_Tecnico.pdf](DFS_Informe_Tecnico.pdf).
+
 DFSha is a block-based distributed file system with NameNode metadata services,
 DataNode block storage, and a Python client. See [the architecture](docs/ARCHITECTURE.md),
 [the API contract](docs/API.md), and [issue 09](docs/issues/09-docker-compose-and-cloud-deploy.md).

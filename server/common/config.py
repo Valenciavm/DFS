@@ -71,6 +71,10 @@ class Settings:
     # --- high availability (API.md Section 9) ---
     lease_s: int = 15
     failover_grace_s: int = 30
+    namenode_id: str = "nn1"
+    namenode_url: str = "http://localhost:8000"
+    namenode_host: str = "0.0.0.0"
+    namenode_port: int = 8000
 
     # --- paging ---
     ls_default_limit: int = 1000
@@ -88,6 +92,8 @@ class Settings:
     #: First admin bootstrapped on first start (ARCHITECTURE.md Section 9).
     admin_user: str = ""
     admin_password: str = field(default="", repr=False)
+    #: PostgreSQL URL enables the persistent metadata and auth stores.
+    postgres_dsn: str = field(default="", repr=False)
 
     def __post_init__(self) -> None:
         self.validate()
@@ -124,6 +130,12 @@ class Settings:
             )
         if self.lease_s <= 1:
             raise ConfigError(f"LEASE_S ({self.lease_s}) is too short to be renewed reliably")
+        if not self.namenode_id.strip():
+            raise ConfigError("NAMENODE_ID must be a non-empty unique process identity")
+        if not self.namenode_url.startswith(("http://", "https://")):
+            raise ConfigError("NAMENODE_URL must be an absolute HTTP(S) URL")
+        if not 1 <= self.namenode_port <= 65535:
+            raise ConfigError("NAMENODE_PORT must be between 1 and 65535")
         if self.jwt_ttl_s <= 0:
             raise ConfigError("JWT_TTL_S must be a positive number of seconds")
 
@@ -160,6 +172,10 @@ def load_settings() -> Settings:
         mfa_challenge_ttl_s=_env_int("MFA_CHALLENGE_TTL_S", 300),
         lease_s=_env_int("LEASE_S", 15),
         failover_grace_s=_env_int("FAILOVER_GRACE_S", 30),
+        namenode_id=_env_str("NAMENODE_ID", "nn1"),
+        namenode_url=_env_str("NAMENODE_URL", "http://localhost:8000").rstrip("/"),
+        namenode_host=_env_str("NAMENODE_HOST", "0.0.0.0"),
+        namenode_port=_env_int("NAMENODE_PORT", 8000, minimum=1),
         ls_default_limit=_env_int("LS_DEFAULT_LIMIT", 1000),
         block_token_secret=_env_str("BLOCK_TOKEN_SECRET", ""),
         node_key=_env_str("NODE_KEY", ""),
@@ -167,6 +183,7 @@ def load_settings() -> Settings:
         jwt_secret=_env_str("JWT_SECRET", ""),
         admin_user=_env_str("ADMIN_USER", ""),
         admin_password=_env_str("ADMIN_PASSWORD", ""),
+        postgres_dsn=_env_str("POSTGRES_DSN", ""),
     )
 
 

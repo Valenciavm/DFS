@@ -121,7 +121,7 @@ class MetadataStore(ABC):
 
     @abstractmethod
     def abort_file(self, file_id: str, now: float) -> None:
-        """`PENDING` to `ABORTED`, releasing the path. The record is kept briefly."""
+        """`PENDING` to `ABORTED`, releasing the path; repeating an abort is a no-op."""
 
     @abstractmethod
     def purge_aborted(self, older_than: float) -> list[FileMetadata]:

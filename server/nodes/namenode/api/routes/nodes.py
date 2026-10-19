@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Header, status
+from fastapi import APIRouter, Depends, status
 
 from server.nodes.namenode.api.deps import get_namenode
 from server.nodes.namenode.api.schemas import (
@@ -25,10 +25,11 @@ from server.nodes.namenode.core import Namenode
 router = APIRouter()
 
 
-def _to_command_schema(cmd: Command) -> NodeCommandSchema:
+def _to_command_schema(cmd: Command, term: int) -> NodeCommandSchema:
     return NodeCommandSchema(
         cmd=cmd.cmd,
         block_id=cmd.block_id,
+        term=term,
         targets=cmd.targets if cmd.targets else None,
         token=cmd.token if cmd.token else None,
     )
@@ -67,7 +68,7 @@ async def heartbeat(
     )
     return HeartbeatResponse(
         term=nn.term,
-        commands=[_to_command_schema(cmd) for cmd in commands]
+        commands=[_to_command_schema(cmd, nn.term) for cmd in commands]
     )
 
 
@@ -89,7 +90,7 @@ async def block_report(
     return BlockReportResponse(
         status="ok",
         term=nn.term,
-        commands=[_to_command_schema(cmd) for cmd in commands],
+        commands=[_to_command_schema(cmd, nn.term) for cmd in commands],
     )
 
 
@@ -104,7 +105,7 @@ async def block_received(
         size=req.size,
         checksum=req.checksum,
     )
-    return BlockReceivedResponse(status="ok")
+    return BlockReceivedResponse(status="ok", term=nn.term)
 
 
 @router.post("/block-corrupt", status_code=status.HTTP_200_OK, response_model=BlockCorruptResponse)
@@ -116,4 +117,4 @@ async def block_corrupt(
         node_id=req.node_id,
         block_id=req.block_id,
     )
-    return BlockCorruptResponse(status="ok")
+    return BlockCorruptResponse(status="ok", term=nn.term)

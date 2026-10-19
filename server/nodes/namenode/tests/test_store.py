@@ -1,11 +1,18 @@
 """The in-memory MetadataStore, against the contract in store/base.py."""
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from server.common.errors import DfshaError, ErrorCode
 from server.nodes.namenode.models import BlockMetadata, FileMetadata, FileStatus
-from server.nodes.namenode.store import USERS_DIR, InMemoryMetadataStore
+from server.nodes.namenode.store import (
+    USERS_DIR,
+    InMemoryMetadataStore,
+    MetadataStore,
+    PostgresMetadataStore,
+)
 
 T0 = 1_000.0
 
@@ -28,9 +35,25 @@ def a_file(name: str, file_id: str = "f1", blocks: int = 2, owner: str = "ana") 
     )
 
 
-@pytest.fixture
-def store() -> InMemoryMetadataStore:
-    s = InMemoryMetadataStore(now=T0)
+@pytest.fixture(
+    params=[
+        pytest.param("memory", id="memory"),
+        pytest.param(
+            "postgres",
+            id="postgres",
+            marks=pytest.mark.skipif(
+                not os.getenv("POSTGRES_TEST_DSN"),
+                reason="POSTGRES_TEST_DSN is not configured",
+            ),
+        ),
+    ]
+)
+def store(request) -> MetadataStore:
+    if request.param == "postgres":
+        postgres_database = request.getfixturevalue("postgres_database")
+        s = PostgresMetadataStore(postgres_database, now=T0)
+    else:
+        s = InMemoryMetadataStore(now=T0)
     s.mkdir("/users/ana", "ana", T0)
     return s
 
@@ -42,10 +65,9 @@ def code_of(call) -> ErrorCode:
 
 
 class TestNamespace:
-    def test_the_users_directory_exists_from_the_start(self):
+    def test_the_users_directory_exists_from_the_start(self, store):
         """Decision 20: every home lives under /users."""
-        s = InMemoryMetadataStore(now=T0)
-        assert s.resolve_dir(USERS_DIR).path() == "/users"
+        assert store.resolve_dir(USERS_DIR).path() == "/users"
 
     def test_mkdir_creates_and_lists_a_directory(self, store):
         store.mkdir("/users/ana/docs", "ana", T0 + 1)
@@ -71,6 +93,18 @@ class TestNamespace:
         store.commit_file("f1", T0)
         assert code_of(lambda: store.resolve_dir("/users/ana/f/x")) is ErrorCode.NOT_A_DIRECTORY
         assert code_of(lambda: store.mkdir("/users/ana/f/x", "ana", T0)) is ErrorCode.NOT_A_DIRECTORY
+
+    def test_a_file_cannot_be_used_as_parent_for_an_upload(self, store):
+        store.create_pending_file("/users/ana/f", a_file("f"))
+        store.commit_file("f1", T0)
+        assert (
+            code_of(
+                lambda: store.create_pending_file(
+                    "/users/ana/f/child", a_file("child", file_id="child")
+                )
+            )
+            is ErrorCode.NOT_A_DIRECTORY
+        )
 
     def test_listing_a_missing_directory_fails(self, store):
         assert code_of(lambda: store.list_dir("/users/nobody")) is ErrorCode.DIR_NOT_FOUND
@@ -104,8 +138,8 @@ class TestPendingUploads:
     def test_but_it_is_reachable_by_id_and_by_path_as_pending(self, store):
         pending = a_file("f")
         store.create_pending_file("/users/ana/f", pending)
-        assert store.get_file_by_id("f1") is pending
-        assert store.get_pending("/users/ana/f") is pending
+        assert store.get_file_by_id("f1") == pending
+        assert store.get_pending("/users/ana/f") == pending
 
     def test_a_pending_upload_reserves_its_path(self, store):
         store.create_pending_file("/users/ana/f", a_file("f"))
@@ -136,8 +170,8 @@ class TestPendingUploads:
     def test_blocks_are_indexed_with_their_file(self, store):
         pending = a_file("f")
         store.create_pending_file("/users/ana/f", pending)
-        assert store.get_block("blk_f1_1") is pending.blocks[1]
-        assert store.file_of_block("blk_f1_1") is pending
+        assert store.get_block("blk_f1_1") == pending.blocks[1]
+        assert store.file_of_block("blk_f1_1") == pending
 
     def test_path_of_works_for_pending_and_committed(self, store):
         store.create_pending_file("/users/ana/f", a_file("f"))
@@ -145,10 +179,9 @@ class TestPendingUploads:
         store.commit_file("f1", T0)
         assert store.path_of("f1") == "/users/ana/f"
 
-    def test_path_of_follows_a_file_at_the_top_level(self):
-        s = InMemoryMetadataStore(now=T0)
-        s.create_pending_file("/top", a_file("top"))
-        assert s.path_of("f1") == "/top"
+    def test_path_of_follows_a_file_at_the_top_level(self, store):
+        store.create_pending_file("/top", a_file("top"))
+        assert store.path_of("f1") == "/top"
 
 
 class TestCommit:
@@ -196,6 +229,7 @@ class TestAbort:
     def test_abort_releases_the_path_but_keeps_the_record(self, store):
         store.create_pending_file("/users/ana/f", a_file("f"))
         store.abort_file("f1", T0 + 5)
+        store.abort_file("f1", T0 + 10)
         assert store.get_pending("/users/ana/f") is None
         record = store.get_file_by_id("f1")
         assert record is not None and record.status is FileStatus.ABORTED
@@ -272,6 +306,70 @@ class TestRemoval:
     def test_the_root_and_the_users_directory_are_protected(self, store):
         assert code_of(lambda: store.remove_dir("/", True, T0)) is ErrorCode.BAD_REQUEST
         assert code_of(lambda: store.remove_dir("/users", True, T0)) is ErrorCode.BAD_REQUEST
+
+
+class TestMove:
+    def test_move_file_updates_its_path_and_timestamp(self, store):
+        store.mkdir("/users/ana/dest", "ana", T0)
+        store.create_pending_file("/users/ana/source", a_file("source"))
+        store.commit_file("f1", T0)
+
+        moved = store.mv("/users/ana/source", "/users/ana/dest/renamed", T0 + 5)
+
+        assert moved.file_id == "f1"
+        assert moved.name == "renamed"
+        assert moved.modified_at == T0 + 5
+        assert store.get_file("/users/ana/source") is None
+        assert store.get_file("/users/ana/dest/renamed").file_id == "f1"
+        assert store.path_of("f1") == "/users/ana/dest/renamed"
+
+    def test_move_directory_updates_descendant_and_pending_upload_paths(self, store):
+        store.mkdir("/users/ana/source/nested", "ana", T0, parents=True)
+        store.mkdir("/users/ana/destination", "ana", T0)
+        store.create_pending_file(
+            "/users/ana/source/nested/pending",
+            a_file("pending", file_id="pending"),
+        )
+        store.create_pending_file(
+            "/users/ana/source/nested/committed",
+            a_file("committed", file_id="committed"),
+        )
+        store.commit_file("committed", T0)
+
+        moved = store.mv(
+            "/users/ana/source", "/users/ana/destination/moved", T0 + 5
+        )
+
+        assert moved.path() == "/users/ana/destination/moved"
+        assert store.path_of("committed") == (
+            "/users/ana/destination/moved/nested/committed"
+        )
+        assert store.get_pending(
+            "/users/ana/destination/moved/nested/pending"
+        ).file_id == "pending"
+        store.commit_file("pending", T0 + 6)
+        assert store.get_file(
+            "/users/ana/destination/moved/nested/pending"
+        ).file_id == "pending"
+
+    def test_move_rejects_descendants_and_existing_destinations(self, store):
+        store.mkdir("/users/ana/source/child", "ana", T0, parents=True)
+        store.mkdir("/users/ana/occupied", "ana", T0)
+
+        assert (
+            code_of(
+                lambda: store.mv(
+                    "/users/ana/source", "/users/ana/source/child/moved", T0
+                )
+            )
+            is ErrorCode.BAD_REQUEST
+        )
+        assert (
+            code_of(
+                lambda: store.mv("/users/ana/source", "/users/ana/occupied", T0)
+            )
+            is ErrorCode.ALREADY_EXISTS
+        )
 
 
 class TestSnapshots:

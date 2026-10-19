@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from typing import Literal
 
 
 @dataclass
@@ -35,7 +36,7 @@ class DataNodeInfo:
 class Command:
     """A command delivered to a DataNode in a heartbeat or block-report response."""
 
-    cmd: str  # "replicate" | "delete"
+    cmd: Literal["replicate", "delete"]
     block_id: str
     targets: list[str] = field(default_factory=list)  # target node_ids (replicate)
     token: str | None = None  # block token for the target write (replicate)

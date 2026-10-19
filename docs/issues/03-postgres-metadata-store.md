@@ -1,11 +1,9 @@
 # PostgreSQL MetadataStore, schema, migrations and replicated metadata
 
-**Depends on:** the auth/ACL core pull request. Persist its authentication
-state and ACL model through a PostgreSQL implementation of `AuthStore`,
-separate from `MetadataStore`. This can be developed in parallel with issue 02
-after that pull request, but production metadata-store wiring is needed by
-issue 06.
-**Branch:** `feat/postgres-metadata-store`, from the tip of the auth branch.
+**Depends on:** the auth/ACL core pull request (merged as PR #7). Persist its
+authentication state and ACL model through a PostgreSQL implementation of
+`AuthStore`, separate from `MetadataStore`.
+**Branch:** `feat/postgres-metadata-store`, based on the latest `main`.
 **Unblocks:** issue 06 (HA lease and second NameNode).
 
 ## Context
@@ -47,6 +45,11 @@ already PostgreSQL-specific.
 The replica is a failover mechanism, not a read pool. The NameNode leader reads
 from its in-memory cache for normal operations; the database is the source of
 truth for hard-state writes and reloads.
+
+The PostgreSQL implementation and manual primary/standby procedure are
+documented in [`POSTGRESQL.md`](../POSTGRESQL.md). This issue does not provide
+automatic database or NameNode failover; the HA lease, reconnection and
+takeover behavior belongs to issue 06.
 
 ## Schema
 
@@ -147,13 +150,15 @@ issue 06 proves service-level takeover.
 
 ## Acceptance checklist
 
-- [ ] `PostgresMetadataStore` implements every method in `MetadataStore`.
-- [ ] Numbered migrations create the complete schema and indexes.
-- [ ] Auth, group, ACL, lock, audit and lease rows are represented.
-- [ ] No DataNode liveness/replica-location table is introduced.
-- [ ] Transaction rollback and atomic commit tests pass.
-- [ ] `POSTGRES_TEST_DSN` integration tests are opt-in and documented.
-- [ ] Local primary/standby promotion is reproducible.
-- [ ] Existing in-memory tests and full `pytest`/`ruff` remain green.
-- [ ] Update `docs/NAMENODE_MODELS.md`, `ARCHITECTURE.md` Section 5.5 and
-  the API changelog if the wire-visible behavior changes.
+- [x] `PostgresMetadataStore` implements every method in the current
+  `MetadataStore` contract, including `mv` added on `main`.
+- [x] Numbered migrations create the complete schema and indexes.
+- [x] Auth, group, ACL, lock, audit and lease rows are represented.
+- [x] No DataNode liveness/replica-location table is introduced.
+- [x] Transaction rollback, overwrite and concurrent uniqueness tests are included.
+- [x] `POSTGRES_TEST_DSN` integration tests are opt-in and documented.
+- [x] Local primary/standby promotion commands are documented.
+- [ ] PostgreSQL integration tests have been run against a real PostgreSQL server.
+- [x] Existing in-memory tests, full `pytest` and `ruff` remain green.
+- [x] Update `docs/NAMENODE_MODELS.md` and `ARCHITECTURE.md` Section 5.5;
+  no API changelog change is needed because the wire behavior is unchanged.

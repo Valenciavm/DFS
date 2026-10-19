@@ -5,6 +5,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query, status
 
+from server.common.errors import DfshaError, ErrorCode
 from server.nodes.namenode.api.deps import get_current_principal, get_namenode
 from server.nodes.namenode.api.schemas import (
     AbortFileRequest,
@@ -35,6 +36,7 @@ async def put_file(
         path=req.path,
         size_bytes=req.size,
         owner=user,
+        overwrite=req.overwrite,
         user=user,
     )
     blocks_schema = [
@@ -43,7 +45,11 @@ async def put_file(
             index=pb.block.index,
             size=pb.block.size_bytes,
             pipeline=[
-                DataNodePublicSchema(node_id=node.node_id, addr=node.public_addr)
+                DataNodePublicSchema(
+                    node_id=node.node_id,
+                    addr=node.public_addr,
+                    internal_addr=node.internal_addr,
+                )
                 for node in pb.pipeline
             ],
             token=pb.token,
@@ -59,11 +65,11 @@ async def put_file(
     )
 
 
-@router.post("/commit", status_code=status.HTTP_200_OK, response_model=CommitFileResponse)
-async def commit_file(
+async def _commit_file(
     req: CommitFileRequest,
-    user: Annotated[str, Depends(get_current_principal)],
-    nn: Annotated[Namenode, Depends(get_namenode)],
+    file_id: str,
+    user: str,
+    nn: Namenode,
 ) -> CommitFileResponse:
     committed_blocks = [
         CommittedBlock(
@@ -75,8 +81,9 @@ async def commit_file(
         for b in req.blocks
     ]
     file_meta = nn.commit_file_upload(
-        file_id=req.file_id,
+        file_id=file_id,
         blocks=committed_blocks,
+        file_checksum=req.file_checksum,
         user=user,
     )
     path = nn.store.path_of(file_meta.file_id)
@@ -89,8 +96,29 @@ async def commit_file(
     )
 
 
+@router.post("/commit", status_code=status.HTTP_200_OK, response_model=CommitFileResponse)
+async def commit_file_legacy(
+    req: CommitFileRequest,
+    user: Annotated[str, Depends(get_current_principal)],
+    nn: Annotated[Namenode, Depends(get_namenode)],
+) -> CommitFileResponse:
+    if req.file_id is None:
+        raise DfshaError(ErrorCode.BAD_REQUEST, "file_id is required")
+    return await _commit_file(req, req.file_id, user, nn)
+
+
+@router.post("/{file_id}/commit", status_code=status.HTTP_200_OK, response_model=CommitFileResponse)
+async def commit_file(
+    file_id: str,
+    req: CommitFileRequest,
+    user: Annotated[str, Depends(get_current_principal)],
+    nn: Annotated[Namenode, Depends(get_namenode)],
+) -> CommitFileResponse:
+    return await _commit_file(req, file_id, user, nn)
+
+
 @router.post("/abort", status_code=status.HTTP_204_NO_CONTENT)
-async def abort_file(
+async def abort_file_legacy(
     req: AbortFileRequest,
     user: Annotated[str, Depends(get_current_principal)],
     nn: Annotated[Namenode, Depends(get_namenode)],
@@ -99,6 +127,15 @@ async def abort_file(
         file_id=req.file_id,
         user=user,
     )
+
+
+@router.post("/{file_id}/abort", status_code=status.HTTP_204_NO_CONTENT)
+async def abort_file(
+    file_id: str,
+    user: Annotated[str, Depends(get_current_principal)],
+    nn: Annotated[Namenode, Depends(get_namenode)],
+) -> None:
+    nn.abort_file_upload(file_id=file_id, user=user)
 
 
 @router.get("/get", status_code=status.HTTP_200_OK, response_model=GetFileResponse)
@@ -127,6 +164,7 @@ async def get_file(
         path=file_location.path,
         size=file_location.file.size_bytes,
         blocks=blocks_schema,
+        checksum=file_location.file.checksum,
     )
 
 

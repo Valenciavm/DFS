@@ -183,7 +183,7 @@ The interface through which the NameNode core reads and writes **hard state**. T
 
 | Implementation | Use |
 |---|---|
-| `PostgresMetadataStore` | Production. Every write is a transaction guarded by the lease: `WHERE leader.holder = :me AND leader.term = :my_term` |
+| `PostgresMetadataStore` | Durable metadata when `POSTGRES_DSN` is configured. Writes use transactions; HA enables a `LeaderGuard` that fences them against a holder, term and unexpired lease. |
 | `InMemoryMetadataStore` | Unit tests only (fake time, no database) |
 
 Responsibilities:
@@ -198,7 +198,7 @@ Responsibilities:
 | `files_by_path` | `dict[str, FileMetadata]` | `get`, `stat`, `rm` without walking the tree |
 | `blocks_by_id` | `dict[str, BlockMetadata]` | `block-received` and block reports |
 
-Cache rules: updated in the same call that writes the database, **after** the commit succeeds; `files_by_path` entries must be rewritten for the whole subtree on `move` and removed on `remove`; on a leadership change the cache is dropped and reloaded.
+Cache rules: updated in the same call that writes the database, **after** the commit succeeds; `files_by_path` entries must be rewritten for the whole subtree on `move` and removed on `remove`; on a leadership change the cache is dropped and reloaded with `load_snapshot()`. Until issue 06 connects lease takeover, this reload is an explicit store operation rather than automatic failover.
 
 `MetadataStore` does **not** hold the DataNode registry. That was in the first version of `models.py` and moves to `ClusterState` (Section 6).
 

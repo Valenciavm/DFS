@@ -174,6 +174,8 @@ class Namenode:
                 )
             )
             self.store.mkdir(admin_home, self.settings.admin_user, self.clock.time(), parents=True)
+        self._locks: dict[str, list[dict[str, object]]] = {}
+        self._locks_by_id: dict[str, dict[str, object]] = {}
 
     # ---- authentication, groups and ACLs --------------------------------
 
@@ -1027,6 +1029,131 @@ class Namenode:
             self._schedule_deletion(file.blocks)
         return len(removed)
 
+    @_audited_fs_operation
+    def mv(
+        self, src: str, dst: str, user: str | None = None
+    ) -> FileMetadata | DirectoryMetadata:
+        """Moves a committed file or directory (API.md Section 4.3)."""
+        actor = self._actor(user)
+        src_canonical = join_path(split_path(src))
+        dst_canonical = join_path(split_path(dst))
+
+        src_parent = join_path(split_path(src_canonical)[:-1])
+        dst_parent = join_path(split_path(dst_canonical)[:-1])
+
+        # Require write on both parents
+        self._require_permission(actor.username, src_parent, Permission.READ_WRITE)
+        self._require_permission(actor.username, dst_parent, Permission.READ_WRITE)
+
+        # Check conflicting locks
+        self.check_lock(src_canonical, actor.username, "exclusive")
+        self.check_lock(dst_canonical, actor.username, "exclusive")
+
+        moved = self.store.mv(src_canonical, dst_canonical, self.clock.time())
+        return moved
+
+    # ---- file locks (API.md Section 4.4) ----------------------------------
+
+    def lock_path(
+        self,
+        path: str,
+        user: str,
+        mode: str = "exclusive",
+        ttl_s: int | None = None,
+    ) -> dict[str, object]:
+        actor = self._actor(user)
+        canonical = join_path(split_path(path))
+        ttl = ttl_s if ttl_s is not None else self.settings.lock_default_ttl_s
+        now = self.clock.time()
+        self._expire_locks(now)
+
+        if mode not in {"shared", "exclusive"}:
+            raise DfshaError(ErrorCode.BAD_REQUEST, "mode must be 'shared' or 'exclusive'")
+
+        held = self._locks.get(canonical, [])
+        for lk in held:
+            if lk["user"] != actor.username:
+                if mode == "exclusive" or lk["mode"] == "exclusive":
+                    raise DfshaError(ErrorCode.LOCKED, f"path {canonical} is currently locked")
+
+        lock_id = f"lk_{uuid.uuid4().hex[:8]}"
+        expires_at = now + ttl
+        lock_entry = {
+            "lock_id": lock_id,
+            "path": canonical,
+            "user": actor.username,
+            "mode": mode,
+            "expires_at": expires_at,
+        }
+        self._locks.setdefault(canonical, []).append(lock_entry)
+        self._locks_by_id[lock_id] = lock_entry
+
+        return {
+            "lock_id": lock_id,
+            "path": canonical,
+            "type": mode,
+            "expires_at": expires_at,
+        }
+
+    def renew_lock(
+        self,
+        lock_id: str,
+        user: str,
+        ttl_s: int | None = None,
+    ) -> dict[str, object]:
+        actor = self._actor(user)
+        now = self.clock.time()
+        self._expire_locks(now)
+        lock_entry = self._locks_by_id.get(lock_id)
+        if lock_entry is None:
+            raise DfshaError(ErrorCode.FILE_NOT_FOUND, f"lock {lock_id} not found or expired")
+        if lock_entry["user"] != actor.username:
+            raise DfshaError(ErrorCode.FORBIDDEN, "only the lock owner may renew it")
+
+        ttl = ttl_s if ttl_s is not None else self.settings.lock_default_ttl_s
+        lock_entry["expires_at"] = now + ttl
+        return {
+            "lock_id": lock_id,
+            "expires_at": lock_entry["expires_at"],
+        }
+
+    def unlock_path(self, lock_id: str, user: str) -> None:
+        actor = self._actor(user)
+        now = self.clock.time()
+        self._expire_locks(now)
+        lock_entry = self._locks_by_id.get(lock_id)
+        if lock_entry is None:
+            return  # Idempotent release
+        if lock_entry["user"] != actor.username:
+            raise DfshaError(ErrorCode.FORBIDDEN, "only the lock owner may unlock it")
+
+        path = lock_entry["path"]
+        del self._locks_by_id[lock_id]
+        if path in self._locks:
+            self._locks[path] = [lk for lk in self._locks[path] if lk["lock_id"] != lock_id]
+            if not self._locks[path]:
+                del self._locks[path]
+
+    def check_lock(self, path: str, username: str, required_access: str = "shared") -> None:
+        """Raises LOCKED (423) if path has a conflicting lock held by another user."""
+        self._expire_locks(self.clock.time())
+        held = self._locks.get(path, [])
+        for lk in held:
+            if lk["user"] != username:
+                if required_access == "exclusive" or lk["mode"] == "exclusive":
+                    raise DfshaError(ErrorCode.LOCKED, f"path {path} is locked by another user")
+
+    def _expire_locks(self, now: float) -> None:
+        expired_ids = [lid for lid, lk in self._locks_by_id.items() if lk["expires_at"] <= now]
+        for lid in expired_ids:
+            lk = self._locks_by_id.pop(lid, None)
+            if lk is not None:
+                p = lk["path"]
+                if p in self._locks:
+                    self._locks[p] = [item for item in self._locks[p] if item["lock_id"] != lid]
+                    if not self._locks[p]:
+                        del self._locks[p]
+
     def _live_holders(self, block_id: str) -> list[str]:
         """Ids of live nodes that have confirmed a copy of the block, sorted."""
         holders = self.cluster.replicas.get(block_id, set())
@@ -1233,12 +1360,19 @@ class Namenode:
         )
 
     async def api_server(self) -> None:
-        """Serves the REST API. The NameNode speaks REST only, never gRPC.
+        """Serves the REST API using uvicorn and FastAPI."""
+        import uvicorn
+        from server.nodes.namenode.api import create_app
 
-        The FastAPI layer is the next build step (``ARCHITECTURE.md`` Section 5.2),
-        so for now this just keeps the process alive next to the other tasks.
-        """
-        await asyncio.Event().wait()
+        app = create_app(self)
+        config = uvicorn.Config(
+            app=app,
+            host=self.settings.namenode_host,
+            port=self.settings.namenode_port,
+            log_level="info",
+        )
+        server = uvicorn.Server(config)
+        await server.serve()
 
     async def monitor_datanodes(self) -> None:
         await self._every(LIVENESS_PERIOD_S, self.check_liveness)

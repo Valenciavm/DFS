@@ -308,6 +308,11 @@ class BlockServiceImpl(pb2_grpc.BlockServiceServicer):
                 self.storage.write_block_info(
                     header.block_id, bytes_received, computed_checksum
                 )
+                asyncio.create_task(
+                    self.dn.notify_block_received(
+                        header.block_id, bytes_received, computed_checksum
+                    )
+                )
 
                 if forward_task is not None and forward_queue is not None:
                     if not forward_task.done():
@@ -484,6 +489,7 @@ class BlockServiceImpl(pb2_grpc.BlockServiceServicer):
             )
             return
         except OSError as error:
+            asyncio.create_task(self.dn.notify_block_corrupt(request.block_id))
             await self._abort_data_loss(context, f"Cannot read block metadata: {error}")
             return
 

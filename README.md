@@ -296,28 +296,28 @@ python -m ruff check client scripts/smoke_test.py server/nodes/namenode/api/rout
 python -m unittest discover -s client/tests
 ```
 
-`POSTGRES_TEST_DSN` es una variable de entorno **solo para las pruebas de
-integración PostgreSQL**; no es necesaria para arrancar la demo ni para usar el
-CLI. Si no está definida, las pruebas que requieren una base PostgreSQL real
-se marcan como omitidas. Si quieres ejecutarlas, configura la variable para
-que apunte a una base de datos de pruebas desechable. El usuario de esa base
-debe poder crear y eliminar esquemas; los tests crean un esquema aislado y lo
-eliminan al finalizar. No apuntes esta variable a una base de datos de
-producción.
-
-En PowerShell, define la variable solo para esa terminal y luego quítala:
-
-```powershell
-$env:POSTGRES_TEST_DSN = "postgresql://usuario:contrasena@localhost:5432/dfsha_test"
-python -m pytest -q
-Remove-Item Env:POSTGRES_TEST_DSN
-```
-
-En Linux, macOS o WSL:
+Los tests que necesitan PostgreSQL leen la variable `POSTGRES_TEST_DSN`. Sin
+ella, pytest los marca como omitidos; por eso puede aparecer un resumen como
+`55 skipped`. No necesitas crear otra base ni publicar el puerto de PostgreSQL:
+Compose ya levanta `postgres-primary`, y `namenode1` está conectado a su red
+privada. Ejecuta la suite desde ese contenedor para que use la misma base
+PostgreSQL del Compose:
 
 ```sh
-POSTGRES_TEST_DSN="postgresql://usuario:contrasena@localhost:5432/dfsha_test" python -m pytest -q
+docker compose exec -T namenode1 sh -lc 'POSTGRES_TEST_DSN="$POSTGRES_DSN" python -m pytest -q'
 ```
+
+El comando reutiliza dentro del contenedor el DSN con el que trabaja el
+NameNode, sin copiar la contraseña a la terminal ni exponer PostgreSQL al host.
+Los tests crean un esquema temporal aislado en esa base y lo eliminan al
+terminar; no apuntes `POSTGRES_TEST_DSN` a una base de datos de producción.
+No ejecutes este comando mientras otra persona use la demo.
+
+También puedes ejecutar la suite desde tu entorno local con `python -m pytest
+-q`; en ese caso, los tests de PostgreSQL se omiten si no defines
+`POSTGRES_TEST_DSN`. El contenedor `client` no está conectado a la red privada
+de PostgreSQL, así que no uses `localhost:5432` desde tu equipo: el Compose no
+publica ese puerto.
 
 ## Seguridad y despliegue
 
